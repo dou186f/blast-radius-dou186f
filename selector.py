@@ -200,9 +200,11 @@ class Selector:
                 return ()  # not a collected test module (gen_fixtures.py, ...)
             out: set[int] = set()
             whole_file = self.by_file.get(path, [])
+            strings = self.strs.get(path, [])
+            bslash = self.bslash.get(path, set())
             for start, lines in hunks:
                 for removed, added, gap in segments(start, lines):
-                    if is_trivial(removed, added, gap, [], set()):
+                    if is_trivial(removed, added, gap, strings, bslash):
                         continue
                     # a change inside one test method hits that test; anything else in
                     # the module (helpers, class attributes, imports) hits the whole file
@@ -217,11 +219,12 @@ class Selector:
         index = self.opens.get(path)
         return self.sets[index] if index is not None else ()
 
-    @staticmethod
-    def has_real_change(hunks, path):
+    def has_real_change(self, hunks, path):
+        strings = self.strs.get(path, [])
+        bslash = self.bslash.get(path, set())
         for start, lines in hunks:
             for removed, added, gap in segments(start, lines):
-                if not is_trivial(removed, added, gap, [], set()):
+                if not is_trivial(removed, added, gap, strings, bslash):
                     return True
         return False
 

@@ -384,6 +384,30 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
             m |= file_cov.get(rel, 0)
         return m
 
+    import_exec_cache = {}
+
+    def import_exec_tests(rel, func):
+        """Tests that can depend on what `func` computed while modules were loading: every
+        test that runs code of this file, plus of each file that calls it at import time."""
+        key = (rel, func.name if func is not None else None)
+        if key in import_exec_cache:
+            return import_exec_cache[key]
+        files = {rel}
+        if func is not None and definitions.get(func.name, 0) <= MAX_DEFINITIONS:
+            for path, line in usages.get(func.name, ()):
+                if line in imp_pre.get(path, ()):
+                    files.add(path)
+        m = nocov
+        for path in files:
+            m |= file_cov.get(path, 0) | name_match_tests(path)
+            dialect = dialect_of(path)
+            if dialect:
+                if dialect not in family_cache:
+                    family_cache[dialect] = family_tests(dialect)
+                m |= family_cache[dialect]
+        import_exec_cache[key] = m
+        return m
+
     impact = {}
     strs = {}
     bslash = {}
@@ -417,10 +441,16 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
                             break
                         m = lines_cov(rel, parent.start, parent.end)
                         parent = parent.parent
+                # A function body that also runs while modules load (__init_subclass__,
+                # metaclass __new__, builders called from class bodies) shapes state every
+                # later test relies on, which no test's coverage records.
+                imp = imp_pre.get(rel, set())
+                if any(line in imp for line in range(unit.start, unit.end + 1)):
+                    m |= import_exec_tests(rel, unit.func)
             elif unit.kind == "def":
                 m = lines_cov(rel, unit.start, node.end_lineno)
-                if not m and _runs_at_import(rel, node):
-                    m = import_time_tests(rel, unit, {node.name})
+                if _runs_at_import(rel, node):
+                    m |= import_exec_tests(rel, node)
             elif unit.kind == "class":
                 m = lines_cov(rel, unit.start, node.end_lineno) | import_time_tests(rel, unit, {node.name})
             else:  # "imp": module level or class body, evaluated at import
@@ -484,10 +514,28 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
         for p, m in d.items():
             opens[p] |= m
 
+    # shared test modules (helpers.py, __init__.py...) need string spans as well
+    for path in sorted(glob.glob(os.path.join(src, "tests", "**", "*.py"), recursive=True)):
+        if not os.path.basename(path).startswith("test_"):
+            spans, bs = string_spans_and_backslashes(open(path, encoding="utf-8").read())
+            rel = os.path.relpath(path, src)
+            if spans:
+                strs[rel] = spans
+            if bs:
+                bslash[rel] = bs
+
     tspans = {}
     for path in sorted(glob.glob(os.path.join(src, "tests", "**", "test_*.py"), recursive=True)):
         rel = os.path.relpath(path, src)
-        tree = ast.parse(open(path, encoding="utf-8").read())
+        test_source = open(path, encoding="utf-8").read()
+        tree = ast.parse(test_source)
+        # test modules are full of multi-line SQL strings: a "# ..." line inside one is
+        # not a comment, so the selector needs their spans too
+        spans, bs = string_spans_and_backslashes(test_source)
+        if spans:
+            strs[rel] = spans
+        if bs:
+            bslash[rel] = bs
         flat = []
         for node in tree.body:
             if isinstance(node, ast.ClassDef):

@@ -43,10 +43,11 @@ def read(root, rel):
         return f.read()
 
 
-def code_mutation(rng, root, files):
-    """Swap one operator/keyword/number token so the file still parses but means something else."""
-    for _ in range(200):
-        rel = rng.choice(files)
+def code_mutation(rng, root, files, targets=None):
+    """Swap one operator/keyword/number token so the file still parses but means something else.
+    With targets ({path: [line, ...]}) only those lines are mutated."""
+    for _ in range(500):
+        rel = rng.choice(sorted(targets) if targets else files)
         text = read(root, rel)
         lines = text.splitlines(keepends=True)
         try:
@@ -54,8 +55,11 @@ def code_mutation(rng, root, files):
         except (tokenize.TokenError, SyntaxError):
             continue
         candidates = []
+        allowed = set(targets[rel]) if targets else None
         for i, tok in enumerate(tokens):
             if tok.start[0] != tok.end[0]:
+                continue
+            if allowed is not None and tok.start[0] not in allowed:
                 continue
             if tok.type == tokenize.NAME and tok.string in SWAPS:
                 candidates.append((i, SWAPS[tok.string]))
@@ -142,9 +146,32 @@ def to_patch(changes):
     return "".join(out)
 
 
-def main(root, out_dir, count, seed=0):
+def main(root, out_dir, count, seed=0, targets_json=None, prefix="m"):
+    """With targets_json ({path: [line, ...]}), writes `count` code mutations on those
+    lines only (targeted probing of one suspected weakness)."""
     rng = random.Random(int(seed))
     count = int(count)
+    if targets_json:
+        targets = json.load(open(targets_json))
+        os.makedirs(os.path.join(out_dir, "commits"), exist_ok=True)
+        kinds, seen = {}, set()
+        while len(kinds) < count:
+            changes = code_mutation(rng, root, [], targets)
+            patch = to_patch(changes)
+            if patch in seen:
+                continue
+            seen.add(patch)
+            cid = f"{prefix}{len(kinds):03d}"
+            with open(os.path.join(out_dir, "commits", f"{cid}.patch"), "w") as f:
+                f.write(patch)
+            kinds[cid] = "code"
+        existing = os.path.join(out_dir, "kinds.json")
+        if os.path.exists(existing):
+            kinds = {**json.load(open(existing)), **kinds}
+        with open(existing, "w") as f:
+            json.dump(kinds, f, indent=1)
+        print(f"wrote {count} targeted patches to {out_dir}", file=sys.stderr)
+        return
     files = sorted(
         os.path.relpath(os.path.join(d, f), root)
         for d, _, fs in os.walk(os.path.join(root, "sqlglot"))
