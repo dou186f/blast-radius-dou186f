@@ -457,21 +457,42 @@ def pack(numbers, duration_ms):
     return best
 
 
+# EXPERIMENT (practice only): the two giant tests (~22 s and ~29 s) dominate the cost of
+# every commit that selects them, and rarely fail there. Drop them unless the edit is in
+# the engine that executes queries, or reaches so much of the suite (400+ tests) that a
+# giant breaking is likely. This is a bet, not a proof: it can miss.
+GIANTS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",
+          "tests/test_parser.py::TestParser::test_max_nodes")
+ENGINE = ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/serde.py")
+BROAD = 400
+
+
+def keep_giants(patch_text: str, chosen) -> bool:
+    if chosen is ALL or len(chosen) >= BROAD:
+        return True
+    return any(line[6:].startswith(ENGINE) for line in patch_text.splitlines()
+               if line.startswith(("+++ b/", "--- a/")))
+
+
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     duration_ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     all_numbers = [t["number"] for t in tests]
+    giants = {t["number"] for t in tests if t["id"] in GIANTS}
     with gzip.open(MAP, "rt") as f:
         selector = Selector(tests, json.load(f))
 
     lines = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
+        text = patch.read_text(encoding="utf-8", errors="replace")
         try:
-            chosen = selector.select(patch.read_text(encoding="utf-8", errors="replace"))
+            chosen = selector.select(text)
         except Exception as error:  # never die on one odd patch: run everything
             print(f"{patch.stem}: {error!r}, running all", file=sys.stderr)
             chosen = ALL
         numbers = all_numbers if chosen is ALL else sorted(chosen)
+        if not keep_giants(text, chosen):
+            numbers = [n for n in numbers if n not in giants]
         workers = pack(numbers, duration_ms)
         lines.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
         print(f"{patch.stem}: {len(numbers)} tests on {len(workers)} workers", file=sys.stderr)
