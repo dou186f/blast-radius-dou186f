@@ -12,14 +12,29 @@ import ast
 import gzip
 import io
 import json
+import os
 import re
+import subprocess
 import sys
+import time
 import tokenize
 from pathlib import Path
 
 DATA = Path("/data")
 MAP = Path(__file__).resolve().parent / "data" / "covmap.json.gz"
 MAX_WORKERS = 8
+# tpc-ds fingerprint (fingerprint.py, built by build_root.py): only present in the image
+APP = Path(__file__).resolve().parent
+FP_ROOT = APP / "root"
+FP_BASELINE = APP / "data" / "tpcds_baseline.json"
+TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+# code that only runs while the executor walks the rows: never proved by the fingerprint
+FP_EXCLUDED = ("sqlglot/executor/", "sqlglot/planner.py")
+FP_MIN_SAVING_MS = 5000
+FP_PARALLEL = 2
+FP_TIMEOUT = 25.0     # seconds for one fingerprint
+FP_LAUNCH_BY = 110.0  # seconds after start: no new fingerprint is started later
+FP_KILL_AT = 150.0    # seconds after start: unfinished fingerprints keep the test
 WORKER_COST_MS = 2000
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -93,6 +108,33 @@ def parse_patch(text: str):
                 start += 1
             current[2].append((start, []))
     return [(old, new, hunks) for old, new, hunks, _ in files]
+
+
+def apply_hunks(source: str, hunks) -> str:
+    """The file after the patch; raises ValueError when a context or removed line differs."""
+    old = source.split("\n")
+    new: list[str] = []
+    pos = 0
+    for start, lines in hunks:
+        target = start - 1
+        if target < pos or target > len(old):
+            raise ValueError("hunk out of order")
+        new.extend(old[pos:target])
+        pos = target
+        for line in lines:
+            tag, text = line[:1], line[1:]
+            if tag == "\\":
+                continue
+            if tag in (" ", "-"):
+                if pos >= len(old) or old[pos] != text:
+                    raise ValueError("patch does not apply")
+                if tag == " ":
+                    new.append(text)
+                pos += 1
+            else:
+                new.append(text)
+    new.extend(old[pos:])
+    return "\n".join(new)
 
 
 def segments(hunk_start: int, lines: list[str]):
@@ -457,24 +499,111 @@ def pack(numbers, duration_ms):
     return best
 
 
+def cost_ms(numbers, duration_ms) -> int:
+    workers = pack(numbers, duration_ms)
+    if not workers:
+        return 0
+    return max(sum(duration_ms[n] for n in w) for w in workers) + WORKER_COST_MS * len(workers)
+
+
+def fingerprint_request(text: str):
+    """{path: patched source} when the tpc-ds fingerprint can prove the patch harmless to
+    test_execute_tpcds: only existing sqlglot modules edited in place, none of them code
+    that runs only during execution. None otherwise."""
+    patched = {}
+    for old, new, hunks in parse_patch(text):
+        if old is None or old != new or not old.startswith("sqlglot/") or not old.endswith(".py"):
+            return None
+        if old.startswith(FP_EXCLUDED) or old in patched:
+            return None
+        source = (FP_ROOT / old).read_text(encoding="utf-8")
+        patched[old] = apply_hunks(source, hunks)
+    return patched or None
+
+
+def run_fingerprints(jobs, started):
+    """jobs: [(key, patched)] -> {key: True when the fingerprint equals the pinned one}.
+    At most FP_PARALLEL at a time; anything that fails, times out or runs past the
+    deadlines counts as not proven."""
+    baseline = json.loads(FP_BASELINE.read_text())
+    env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
+    script = str(APP / "fingerprint.py")
+    proven, running, queue = {}, [], list(jobs)
+    while queue or running:
+        now = time.monotonic() - started
+        while queue and len(running) < FP_PARALLEL and now < FP_LAUNCH_BY:
+            key, patched = queue.pop(0)
+            proc = subprocess.Popen([sys.executable, script, str(FP_ROOT)],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, env=env, text=True)
+            proc.stdin.write(json.dumps({"patched": patched, "baseline": baseline}))
+            proc.stdin.close()
+            running.append((key, proc, time.monotonic()))
+        if now >= FP_LAUNCH_BY:
+            queue.clear()
+        still = []
+        for key, proc, t0 in running:
+            if proc.poll() is None:
+                if time.monotonic() - t0 > FP_TIMEOUT or time.monotonic() - started > FP_KILL_AT:
+                    proc.kill()
+                    proc.wait()
+                    print(f"{key}: fingerprint timed out", file=sys.stderr)
+                else:
+                    still.append((key, proc, t0))
+                continue
+            out = proc.stdout.read()
+            try:
+                proven[key] = proc.returncode == 0 and json.loads(out).get("match") is True
+            except ValueError:
+                proven[key] = False
+        running = still
+        if running:
+            time.sleep(0.02)
+    return proven
+
+
 def main() -> None:
+    started = time.monotonic()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     duration_ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     all_numbers = [t["number"] for t in tests]
+    tpcds = next((t["number"] for t in tests if t["id"] == TPCDS), None)
+    fingerprint = FP_ROOT.is_dir() and FP_BASELINE.is_file() and tpcds is not None
     with gzip.open(MAP, "rt") as f:
         selector = Selector(tests, json.load(f))
 
-    lines = []
+    results, jobs = [], []
     for patch in sorted((DATA / "commits").glob("*.patch")):
+        text = patch.read_text(encoding="utf-8", errors="replace")
         try:
-            chosen = selector.select(patch.read_text(encoding="utf-8", errors="replace"))
+            chosen = selector.select(text)
         except Exception as error:  # never die on one odd patch: run everything
             print(f"{patch.stem}: {error!r}, running all", file=sys.stderr)
             chosen = ALL
         numbers = all_numbers if chosen is ALL else sorted(chosen)
+        results.append((patch.stem, numbers))
+        if fingerprint and chosen is not ALL and tpcds in chosen:
+            without = [n for n in numbers if n != tpcds]
+            saving = cost_ms(numbers, duration_ms) - cost_ms(without, duration_ms)
+            if saving >= FP_MIN_SAVING_MS:
+                try:
+                    patched = fingerprint_request(text)
+                except Exception as error:  # a patch we cannot apply: keep the test
+                    print(f"{patch.stem}: {error!r}, keeping tpc-ds", file=sys.stderr)
+                    patched = None
+                if patched:
+                    jobs.append((saving, patch.stem, patched))
+    jobs.sort(key=lambda job: -job[0])  # the biggest savings first, in case time runs out
+    proven = run_fingerprints([(key, patched) for _, key, patched in jobs], started) if jobs else {}
+
+    lines = []
+    for stem, numbers in results:
+        if proven.get(stem):
+            numbers = [n for n in numbers if n != tpcds]
+            print(f"{stem}: tpc-ds fingerprint unchanged, test_execute_tpcds dropped", file=sys.stderr)
         workers = pack(numbers, duration_ms)
-        lines.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
-        print(f"{patch.stem}: {len(numbers)} tests on {len(workers)} workers", file=sys.stderr)
+        lines.append(json.dumps({"commit": stem, "workers": workers}, separators=(",", ":")))
+        print(f"{stem}: {len(numbers)} tests on {len(workers)} workers", file=sys.stderr)
     sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
 
 
