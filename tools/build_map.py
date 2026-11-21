@@ -37,6 +37,9 @@ FAMILY_DIRS = ("dialects", "parsers", "generators", "typing")
 # its readers are generic code, so they say nothing about which tests one definition hits.
 MAX_DEFINITIONS = 3
 MAX_USAGE_LINES = 60
+# A core setting read in more places than this is treated as unknowable (skipped here and
+# left to the other rules); real flags are read in a handful of places.
+MAX_READER_SITES = 300
 
 
 # --------------------------------------------------------------------------- coverage
@@ -320,6 +323,7 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
                     if base:
                         subclasses[base].add(node.name)
     built_cache = {}
+    expr_classes = descendants("Expr", subclasses)
 
     def built_tests(class_name):
         """Tests that built an object of this class or of any subclass of it."""
@@ -384,14 +388,43 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
             m |= file_cov.get(rel, 0)
         return m
 
+    reader_cache = {}
+
+    def reader_tests(rel, names, skip_start, skip_end):
+        """For a setting defined in a core (non-dialect) module: every place that reads it.
+        A read at run time charges the tests that execute that line; a read while modules
+        load (metaclasses, __init_subclass__, other class bodies) bakes the value into
+        classes every test may use, so it charges every test."""
+        m = 0
+        for n in names:
+            key = (rel, n, skip_start)
+            if key not in reader_cache:
+                r = 0
+                sites = usages.get(n, ())
+                if len(sites) <= MAX_READER_SITES:
+                    for path, line in sites:
+                        if path == rel and skip_start <= line <= skip_end:
+                            continue
+                        if line in imp_pre.get(path, ()):
+                            r = all_tests
+                            break
+                        r |= cov.get(path, {}).get(line, 0)
+                reader_cache[key] = r
+            m |= reader_cache[key]
+        return m
+
     import_exec_cache = {}
 
     def import_exec_tests(rel, func):
-        """Tests that can depend on what `func` computed while modules were loading: every
-        test that runs code of this file, plus of each file that calls it at import time."""
+        """Tests that can depend on what `func` computed while modules were loading. In a
+        core module that is everything (it may run for every class or template sqlglot
+        builds on import); in a dialect module, that dialect's family and its callers."""
         key = (rel, func.name if func is not None else None)
         if key in import_exec_cache:
             return import_exec_cache[key]
+        if not dialect_of(rel):
+            import_exec_cache[key] = all_tests
+            return all_tests
         files = {rel}
         if func is not None and definitions.get(func.name, 0) <= MAX_DEFINITIONS:
             for path, line in usages.get(func.name, ()):
@@ -481,19 +514,38 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
         def import_line_tests(unit, line):
             """Impact of changing one line of an import-time statement."""
             node = unit.node
+            # reader_tests is for core settings (Generator/Tokenizer/Dialect flags, module
+            # constants). Expression classes (arg_types, is_var_len_args...) are read by
+            # __init_subclass__ for every class; built_tests already pins them down exactly.
+            # (matched by file too: generator.py's Generator is not the GENERATOR() expression)
+            expr_body = (rel.startswith("sqlglot/expressions/") and bool(unit.classes)
+                         and unit.classes[-1] in expr_classes)
+            core = not dialect_of(rel) and not expr_body
             if unit.end == unit.start or isinstance(node, (ast.Import, ast.ImportFrom)):
                 names = header_names(node)
-                return unit_tests(unit) | lines_cov(rel, unit.start, unit.end) | usage_tests(
+                m = unit_tests(unit) | lines_cov(rel, unit.start, unit.end) | usage_tests(
                     names, rel, unit.start, unit.end)
+                if core:  # a core setting such as Generator.CAST_TO_INT_ROUNDS = False
+                    m |= reader_tests(rel, assigned_names(node), unit.start, unit.end)
+                return m
             containing = [e for e in elements(unit) if e[0] <= line <= e[1]]
             if containing:
+                # one entry of a dict/list/call: only what that entry reaches, including the
+                # tests that build any expression class it names ("ARRAY": ... exp.Array(...))
                 start, end, nodes = min(containing, key=lambda e: e[1] - e[0])
                 names = set()
                 for n in nodes:
                     names |= loaded_names(n)
-            else:  # the statement's own frame: "X = {", "}" ...
-                start, end, names = line, line, header_names(node)
-            return unit_tests(unit) | lines_cov(rel, start, end) | usage_tests(names, rel, unit.start, unit.end)
+                m = unit_tests(unit) | lines_cov(rel, start, end) | usage_tests(names, rel, unit.start, unit.end)
+                for n in names:
+                    m |= built_tests(n)
+                return m
+            # the statement's own frame: "X = {", "}", or a multi-line setting
+            m = unit_tests(unit) | lines_cov(rel, line, line) | usage_tests(
+                header_names(node), rel, unit.start, unit.end)
+            if core:
+                m |= reader_tests(rel, assigned_names(node), unit.start, unit.end)
+            return m
 
         def _runs_at_import(path, func):
             imp = imp_pre.get(path, set())

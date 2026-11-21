@@ -11,11 +11,14 @@ import os
 
 _failed = set()
 _broken_files = set()
+_crashed = set()  # a worker died (e.g. killed for memory): this run's labels can't be trusted
 
 
 def pytest_runtest_logreport(report):
     if report.failed:
         _failed.add(report.nodeid.split("[", 1)[0])
+        if "crashed while running" in str(report.longrepr):
+            _crashed.add(report.nodeid)
 
 
 def pytest_collectreport(report):
@@ -28,4 +31,4 @@ def pytest_sessionfinish(session, exitstatus):
         return
     with open(os.environ["FAILPLUGIN_OUT"], "w") as f:
         json.dump({"failed": sorted(_failed), "broken_files": sorted(_broken_files),
-                   "exitstatus": int(exitstatus)}, f)
+                   "crashed": sorted(_crashed), "exitstatus": int(exitstatus)}, f)

@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 IMAGE = "python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90"
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -45,30 +45,46 @@ def run_one(src, val, cid, uid):
     work = os.path.join(val, "work", cid)
     shutil.rmtree(work, ignore_errors=True)
     apply_patch(src, work, os.path.join(val, "commits", f"{cid}.patch"))
-    rel_work = os.path.relpath(work, ROOT)
     rel_out = os.path.relpath(out, ROOT)
     start = time.time()
+    # Hard memory cap per container and no swap: a run that needs more is killed inside
+    # its own container instead of taking the whole machine down (TPC-DS tests copy their
+    # tables into every pool process). The cgroup's peak usage is reported afterwards.
+    pytest = ("/work/.covenv/bin/python -m pytest tests -p failplugin -p no:cacheprovider "
+              f"-p no:pytest_cov -n {WORKERS} --timeout 240 -q >/dev/null 2>&1; "
+              "cat /sys/fs/cgroup/memory.peak")
     cmd = [
         "docker", "run", "--rm", "--user", uid, "-e", "HOME=/tmp",
-        "-e", "SKIP_INTEGRATION=0", "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", "PYTHON_CPU_COUNT=4",
+        "--memory", MEMORY, "--memory-swap", MEMORY,
+        "-e", "SKIP_INTEGRATION=0", "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", f"PYTHON_CPU_COUNT={POOL}",
         "-e", "PYTHONPATH=/src:/work/tools", "-e", f"FAILPLUGIN_OUT=/work/{rel_out}",
         "-v", f"{os.path.abspath(work)}:/src:ro", "-v", f"{ROOT}:/work", "-w", "/src", IMAGE,
-        "/work/.covenv/bin/python", "-m", "pytest", "tests", "-p", "failplugin", "-p", "no:cacheprovider",
-        "-p", "no:pytest_cov", "-n", "8", "--timeout", "240", "-q",
+        "sh", "-c", pytest,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     shutil.rmtree(work, ignore_errors=True)
+    peak = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "?"
+    peak = f"{int(peak) / 2**30:.1f}GB" if peak.isdigit() else peak
     if not os.path.exists(out):
-        raise RuntimeError(f"{cid}: no result, pytest said:\n{proc.stdout[-2000:]}{proc.stderr[-2000:]}")
-    return cid, f"{time.time() - start:.0f}s"
+        raise RuntimeError(f"{cid}: no result (peak {peak}, killed for memory?)")
+    if json.load(open(out)).get("crashed"):
+        os.remove(out)  # a worker died: labels unreliable, retried on the next run
+        raise RuntimeError(f"{cid}: a test worker crashed (peak {peak}), result discarded")
+    return cid, f"{time.time() - start:.0f}s peak {peak}"
 
 
-def main(src, tests_json, val, parallel=3):
+MEMORY = os.environ.get("LABEL_MEMORY", "6g")
+WORKERS = int(os.environ.get("LABEL_WORKERS", "6"))
+POOL = int(os.environ.get("LABEL_POOL", "2"))
+
+
+def main(src, tests_json, val, parallel=2):
     os.makedirs(os.path.join(val, "results"), exist_ok=True)
     uid = f"{os.getuid()}:{os.getgid()}"
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(val, "commits")) if p.endswith(".patch"))
     with ThreadPoolExecutor(int(parallel)) as pool:
-        for future in [pool.submit(run_one, src, val, c, uid) for c in commits]:
+        # report each mutant as soon as it finishes (or fails), not in submission order
+        for future in as_completed([pool.submit(run_one, src, val, c, uid) for c in commits]):
             try:
                 cid, note = future.result()
                 print(f"{cid} {note}", file=sys.stderr, flush=True)
