@@ -27,36 +27,64 @@ ALL = "ALL"
 
 
 # --------------------------------------------------------------------------- diff
+def _strip_prefix(path: str, prefix: str):
+    path = path.split("\t")[0].strip()
+    if path == "/dev/null":
+        return None
+    return path[2:] if path.startswith(prefix) else path
+
+
 def parse_patch(text: str):
-    """-> [(old_path, new_path, [(old_start, [line, ...]), ...])]"""
-    files = []
+    """-> [(old_path, new_path, [(old_start, [line, ...]), ...])]
+
+    Hunk bodies are consumed by their line counts, so a removed SQL comment ("-- x" shows
+    up as "--- x") is never mistaken for a file header, and plain unified diffs without a
+    "diff --git" line work too. Renames and new/deleted files keep None on the missing side.
+    """
+    files: list[list] = []
     current = None
-    old_path = new_path = None
+    old_left = new_left = 0
     for line in text.split("\n"):
+        if old_left > 0 or new_left > 0:  # inside a hunk body
+            tag = line[:1] if line else " "  # a context line whose single space was stripped
+            if tag in (" ", "-", "+", "\\"):
+                if tag in (" ", "-"):
+                    old_left -= 1
+                if tag in (" ", "+"):
+                    new_left -= 1
+                current[2][-1][1].append(line or " ")
+                continue
+            old_left = new_left = 0  # malformed or truncated hunk: fall through to headers
         if line.startswith("diff --git "):
-            current = None
-            old_path = new_path = None
             parts = line.split(" ")
-            if len(parts) >= 4:
-                old_path, new_path = parts[2][2:], parts[3][2:]
-            files.append([old_path, new_path, []])
-            current = files[-1]
-        elif current is not None and line.startswith("--- ") and not current[2]:
-            p = line[4:].split("\t")[0]
-            current[0] = None if p == "/dev/null" else p[2:] if p.startswith("a/") else p
-        elif current is not None and line.startswith("+++ ") and not current[2]:
-            p = line[4:].split("\t")[0]
-            current[1] = None if p == "/dev/null" else p[2:] if p.startswith("b/") else p
-        elif current is not None and line.startswith("@@"):
+            old_path = parts[2][2:] if len(parts) >= 4 else None
+            new_path = parts[3][2:] if len(parts) >= 4 else None
+            current = [old_path, new_path, [], False]
+            files.append(current)
+        elif line.startswith("--- "):
+            if current is None or current[2] or current[3]:  # a new file section
+                current = [None, None, [], False]
+                files.append(current)
+            current[0] = _strip_prefix(line[4:], "a/")
+            current[3] = True
+        elif line.startswith("+++ ") and current is not None:
+            current[1] = _strip_prefix(line[4:], "b/")
+        elif line.startswith("rename from ") and current is not None:
+            current[0] = line[len("rename from "):].strip()
+        elif line.startswith("rename to ") and current is not None:
+            current[1] = line[len("rename to "):].strip()
+        elif line.startswith("new file mode") and current is not None:
+            current[0] = None
+        elif line.startswith("deleted file mode") and current is not None:
+            current[1] = None
+        elif line.startswith("@@") and current is not None:
             m = HUNK.match(line)
             if not m:
                 raise ValueError("bad hunk header")
+            old_left = int(m.group(2)) if m.group(2) is not None else 1
+            new_left = int(m.group(4)) if m.group(4) is not None else 1
             current[2].append((int(m.group(1)), []))
-        elif current is not None and current[2] and line[:1] in (" ", "-", "+", "\\"):
-            current[2][-1][1].append(line)
-        elif current is not None and current[2] and line == "":
-            current[2][-1][1].append(" ")  # a context line whose single space was stripped
-    return files
+    return [(old, new, hunks) for old, new, hunks, _ in files]
 
 
 def segments(hunk_start: int, lines: list[str]):
@@ -136,6 +164,7 @@ class Selector:
         self.bslash = {p: set(v) for p, v in cmap["bslash"].items()}
         self.opens = cmap["opens"]
         self.tspans = cmap["tspans"]
+        self.timport = cmap.get("timport", {})
         self.nocov = self.sets[cmap["nocov"]]
         self.by_file: dict[str, list[int]] = {}
         for t in tests:
@@ -157,10 +186,18 @@ class Selector:
         path = old_path or new_path
         if path is None:
             return ALL
-        if old_path is None:  # a brand-new file: nothing imports or opens it yet
-            return ()
-        if new_path is None and path.startswith(("sqlglot/", "tests/")):
+        in_suite = path.startswith(("sqlglot/", "tests/"))
+        if old_path is None:  # a brand-new file
+            name = path.rsplit("/", 1)[-1]
+            if path.startswith("tests/") and name in ("conftest.py", "__init__.py"):
+                return ALL  # pytest loads it for every test below it
+            if path.startswith("sqlglot/") and path.endswith(".py"):
+                return self.nocov  # tests that walk sqlglot's package directories
+            return ()  # nothing imports or opens it yet
+        if new_path is None and in_suite:
             return ALL  # deleting a module or fixture
+        if new_path != old_path and in_suite:
+            return ALL  # a renamed module or fixture is gone from where it was imported
         if path.endswith(".py") and path.startswith("sqlglot/"):
             return self.select_source(path, hunks)
         if path.startswith("tests/"):
@@ -214,7 +251,15 @@ class Selector:
                         if spans[i] <= first and last <= spans[i + 1]:
                             owner = self.sets[spans[i + 2]]
                             break
-                    out.update(whole_file if owner is None else owner)
+                    if owner is None:
+                        # helpers such as Validator in test_dialect.py are imported by
+                        # other test modules: those break too
+                        out.update(whole_file)
+                        index = self.timport.get(path)
+                        if index is not None:
+                            out.update(self.sets[index])
+                    else:
+                        out.update(owner)
             return out
         index = self.opens.get(path)
         return self.sets[index] if index is not None else ()

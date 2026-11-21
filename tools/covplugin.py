@@ -92,15 +92,26 @@ def _set_context(context):
 
 
 def _record_expression_classes():
+    """Record, per test, the classes it builds objects of: expressions, plus the dialect,
+    tokenizer, parser and generator classes (sqlglot creates a fresh one per call, so this
+    tells exactly which dialects a test uses, even as a write target only)."""
+    from sqlglot.dialects.dialect import Dialect
     from sqlglot.expressions.core import Expr
+    from sqlglot.generator import Generator
+    from sqlglot.parser import Parser
+    from sqlglot.tokens import Tokenizer
 
-    original = Expr.__init__
+    def wrap(base):
+        original = base.__init__
 
-    def __init__(self, **args):
-        _current_classes.add(self.__class__)
-        original(self, **args)
+        def __init__(self, *args, **kwargs):
+            _current_classes.add(self.__class__)
+            original(self, *args, **kwargs)
 
-    Expr.__init__ = __init__
+        base.__init__ = __init__
+
+    for base in (Expr, Dialect, Tokenizer, Parser, Generator):
+        wrap(base)
 
 
 def pytest_collection(session):

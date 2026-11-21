@@ -40,6 +40,8 @@ MAX_USAGE_LINES = 60
 # A core setting read in more places than this is treated as unknowable (skipped here and
 # left to the other rules); real flags are read in a handful of places.
 MAX_READER_SITES = 300
+SWEEPER_DIALECTS = 25
+SWEEPER_SECONDS = 1.0
 
 
 # --------------------------------------------------------------------------- coverage
@@ -93,6 +95,7 @@ def load_run(run_dir, index_of, by_class):
             mask = charged(context) or 0
             for key in keys:
                 built[key.rsplit(":", 1)[1].rsplit(".", 1)[-1]] |= mask
+                built[key] |= mask  # exact "module:qualname" as well
     return cov, imports, opens, built
 
 
@@ -217,7 +220,7 @@ def assigned_names(node):
 
 
 # --------------------------------------------------------------------------- main
-def main(src, tests_json, lazy_dir, pre_dir, out):
+def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
     tests = json.load(open(tests_json))["tests"]
     test_ids = [t["id"] for t in tests]
     index_of = {tid: i for i, tid in enumerate(test_ids)}
@@ -247,6 +250,23 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
                 mask |= cov_lazy.get(path, {}).get(line, 0)
             if mask:
                 cov[path][line] = mask
+    # Order-dependent lines: run-once code behind a cache (generator._DISPATCH_CACHE,
+    # Dialect._classes ...) is charged only to whichever test got there first, so its test
+    # set changes with the schedule. A serial run vs the 16-worker run exposes it.
+    order_dependent = defaultdict(set)
+    if serial_dir:
+        cov_serial, imp_serial, _, _ = load_run(serial_dir, index_of, by_class)
+        for path in set(cov_pre) | set(cov_serial):
+            imp = imp_pre.get(path, set()) | imp_serial.get(path, set())
+            a, b = cov_pre.get(path, {}), cov_serial.get(path, {})
+            for line in set(a) | set(b):
+                if line not in imp and a.get(line, 0) != b.get(line, 0):
+                    order_dependent[path].add(line)
+                    # the serial run saw it too: keep its tests as well
+                    cov.setdefault(path, {})[line] = cov.get(path, {}).get(line, 0) | b.get(line, 0)
+        print(f"order-dependent lines: {sum(map(len, order_dependent.values()))} in "
+              f"{len(order_dependent)} files", file=sys.stderr)
+
     covered_any = 0
     for lines in cov.values():
         for m in lines.values():
@@ -340,7 +360,34 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
             for folder in FAMILY_DIRS:
                 m |= file_cov.get(f"sqlglot/{folder}/{d}.py", 0)
             m |= by_file.get(f"tests/dialects/test_{d}.py", 0)
+            # tests that used this dialect at all, e.g. only as a validate_all write
+            # target through shared Generator code (Drill.TYPED_DIVISION -> test_mysql)
+            for folder in ("dialects", "parsers", "generators"):
+                tree = trees.get(f"sqlglot/{folder}/{d}.py")
+                for node in tree.body if tree else []:
+                    if isinstance(node, ast.ClassDef):
+                        m |= built.get(f"sqlglot.{folder}.{d}:{node.name}", 0) & ~sweepers
         return m
+
+    # Tests that merely sweep every dialect (test_generator_memory builds 1000 generators
+    # per dialect and measures memory; it never parses or generates SQL) would otherwise be
+    # charged to every dialect setting. Expensive sweepers keep only the coverage-based
+    # family rule; cheap ones (test_enum, 0.03 s) stay in, they cost nothing.
+    dialect_users = defaultdict(set)
+    for key, mask in built.items():
+        module, _, _ = key.partition(":")
+        parts = module.split(".")
+        if len(parts) == 3 and parts[1] in ("dialects", "parsers", "generators") and parts[2] in dialect_names:
+            for i in range(len(tests)):
+                if mask >> i & 1:
+                    dialect_users[i].add(parts[2])
+    sweepers = 0
+    for i, used in dialect_users.items():
+        if len(used) >= SWEEPER_DIALECTS and tests[i]["seconds"] > SWEEPER_SECONDS:
+            sweepers |= 1 << i
+    print(f"dialect sweepers left to the coverage rule: "
+          f"{[tests[i]['id'].rsplit('::', 1)[-1] for i in range(len(tests)) if sweepers >> i & 1]}",
+          file=sys.stderr)
 
     family_cache = {}
 
@@ -378,11 +425,14 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
         m |= usage_tests(names | set(unit.classes[-1:]), rel, unit.start, unit.end)
         # a class-level setting (arg_types, is_var_len_args, ...) or a class header can only
         # reach tests that build objects of that class or of one of its subclasses
+        # (expression classes only: dialect classes are covered by the dialect-usage rule
+        #  above, and their nested "class Tokenizer:" would match every tokenizer by name)
         owners = list(unit.classes[-1:])
         if isinstance(unit.node, ast.ClassDef):
             owners.append(unit.node.name)
-        for owner in owners:
-            m |= built_tests(owner)
+        if rel.startswith("sqlglot/expressions/"):
+            for owner in owners:
+                m |= built_tests(owner)
         if not dialect and not (m & ~nocov):
             # nothing specific found: everything that runs the enclosing class or file
             m |= file_cov.get(rel, 0)
@@ -441,6 +491,51 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
         import_exec_cache[key] = m
         return m
 
+    functions_of = {}
+
+    def function_at(path, line):
+        """Innermost def containing `line` in `path`, or None."""
+        if path not in functions_of:
+            functions_of[path] = sorted(
+                (n for n in ast.walk(trees[path]) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))),
+                key=lambda n: n.end_lineno - n.lineno,
+            ) if path in trees else []
+        for fn in functions_of[path]:
+            if fn.lineno <= line <= fn.end_lineno:
+                return fn
+        return None
+
+    escalate_cache = {}
+
+    def escalate(path, func, depth=0):
+        """Everyone who relies on what an order-dependent (cached, run-once) piece of `func`
+        computed: the tests running func's stable lines, i.e. calling it every time. When
+        func itself only runs on a cache miss (_build_dispatch), climb to its callers."""
+        key = (path, func.lineno)
+        if key in escalate_cache:
+            return escalate_cache[key]
+        escalate_cache[key] = all_tests  # recursion guard: be safe on cycles
+        od = order_dependent.get(path, set())
+        c = cov.get(path, {})
+        m = 0
+        # If func's own first statement is order-dependent, func itself only runs on a
+        # cache miss (_build_dispatch, Dialect._try_load): its other stable lines are rare
+        # side branches (plugin loading), so climb to the callers instead.
+        if func.body[0].lineno not in od:
+            for line in range(func.body[0].lineno, func.end_lineno + 1):
+                if line not in od:
+                    m |= c.get(line, 0)
+        if not m:
+            if depth >= 3 or definitions.get(func.name, 0) > MAX_DEFINITIONS:
+                m = file_cov.get(path, 0) or all_tests
+            else:
+                for site_path, site_line in usages.get(func.name, ()):
+                    caller = function_at(site_path, site_line)
+                    m |= escalate(site_path, caller, depth + 1) if caller else file_cov.get(site_path, 0)
+                m = m or file_cov.get(path, 0) or all_tests
+        escalate_cache[key] = m
+        return m
+
     impact = {}
     strs = {}
     bslash = {}
@@ -480,6 +575,11 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
                 imp = imp_pre.get(rel, set())
                 if any(line in imp for line in range(unit.start, unit.end + 1)):
                     m |= import_exec_tests(rel, unit.func)
+                # cached / run-once code: charge everyone who uses the cached result
+                od = order_dependent.get(rel)
+                if od and unit.func is not None and any(
+                        line in od for line in range(unit.start, unit.end + 1)):
+                    m |= escalate(rel, unit.func)
             elif unit.kind == "def":
                 m = lines_cov(rel, unit.start, node.end_lineno)
                 if _runs_at_import(rel, node):
@@ -539,6 +639,10 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
                 m = unit_tests(unit) | lines_cov(rel, start, end) | usage_tests(names, rel, unit.start, unit.end)
                 for n in names:
                     m |= built_tests(n)
+                if core and not any(isinstance(sub, (ast.Lambda, ast.Call))
+                                    for n in nodes for sub in ast.walk(n)):
+                    # a plain value ({exp.Union: True, ...}): reaches tests via its readers
+                    m |= reader_tests(rel, assigned_names(node), unit.start, unit.end)
                 return m
             # the statement's own frame: "X = {", "}", or a multi-line setting
             m = unit_tests(unit) | lines_cov(rel, line, line) | usage_tests(
@@ -575,6 +679,29 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
                 strs[rel] = spans
             if bs:
                 bslash[rel] = bs
+
+    importers = defaultdict(set)  # test module path -> test files importing it
+    for path in sorted(glob.glob(os.path.join(src, "tests", "**", "*.py"), recursive=True)):
+        rel = os.path.relpath(path, src)
+        for node in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("tests."):
+                target = node.module.replace(".", "/") + ".py"
+                importers[target].add(rel)
+    changed = True
+    while changed:  # transitive: importers of importers
+        changed = False
+        for target, files in list(importers.items()):
+            extra = set().union(*(importers.get(f, set()) for f in files)) - files
+            if extra:
+                files |= extra
+                changed = True
+    timport = {}
+    for target, files in importers.items():
+        mask = 0
+        for f in files:
+            mask |= by_file.get(f, 0)
+        if mask:
+            timport[target] = mask
 
     tspans = {}
     for path in sorted(glob.glob(os.path.join(src, "tests", "**", "test_*.py"), recursive=True)):
@@ -619,6 +746,7 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
         "bslash": bslash,
         "opens": {p: intern(m) for p, m in sorted(opens.items())},
         "tspans": {p: [x for s, e, m in v for x in (s, e, intern(m))] for p, v in tspans.items()},
+        "timport": {p: intern(m) for p, m in sorted(timport.items())},
         "nocov": intern(nocov),
     }
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -629,4 +757,4 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:6])
+    main(*sys.argv[1:7])

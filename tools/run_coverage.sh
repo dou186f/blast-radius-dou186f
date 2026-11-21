@@ -10,8 +10,11 @@ PREIMPORT=$2
 IMAGE=python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 ROOT=$(pwd)
 mkdir -p "$ROOT/build/$NAME"
+# Hard caps, no swap: a runaway run is killed inside its container instead of freezing
+# the machine. Override with COVERAGE_MEMORY / COVERAGE_CPUS.
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
-  -e COVMAP_PREIMPORT="$PREIMPORT" -e COVMAP_OUT="/work/build/$NAME" \
+  --memory "${COVERAGE_MEMORY:-8g}" --memory-swap "${COVERAGE_MEMORY:-8g}" --cpus "${COVERAGE_CPUS:-16}" \
+  -e COVMAP_PREIMPORT="$PREIMPORT" -e COVMAP_OUT="/work/build/$NAME" -e WORKERS="${WORKERS:-16}" \
   -e COVERAGE_FILE="/work/build/$NAME/.coverage" \
   -v "$ROOT/sqlglot-src:/src:ro" -v "$ROOT:/work" -w /src "$IMAGE" sh -c '
 set -eu
@@ -22,5 +25,5 @@ fi
 rm -f "$COVMAP_OUT"/.coverage* "$COVMAP_OUT"/opens-*.json "$COVMAP_OUT"/classes-*.json
 export SKIP_INTEGRATION=0 COVMAP_ROOT=/src PYTHONPATH=/src:/work/tools PYTHONDONTWRITEBYTECODE=1
 /work/.covenv/bin/python -m pytest tests -p covplugin -p no:cacheprovider \
-  -n 16 --cov=sqlglot --cov-context=test --cov-report= -q 2>&1 | tail -3
+  -n ${WORKERS} --cov=sqlglot --cov-context=test --cov-report= -q 2>&1 | tail -3
 '
