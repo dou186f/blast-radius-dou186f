@@ -8,6 +8,7 @@ Standard library only; stdout carries answers only, logs go to stderr.
 
 from __future__ import annotations
 
+import ast
 import gzip
 import io
 import json
@@ -190,6 +191,37 @@ def in_string(spans, line: int) -> bool:
     return False
 
 
+def reindented(removed, added):
+    """A moved statement can run on a new path or prevent the module from importing."""
+    old = [line for _, line in removed if code_part(line).strip()]
+    new = [line for line in added if code_part(line).strip()]
+    return len(old) == len(new) and any(
+        a[:len(a) - len(a.lstrip())] != b[:len(b) - len(b.lstrip())]
+        for a, b in zip(old, new)
+    )
+
+
+def literal_mask(spans, old, new):
+    for start, end, mask in spans:
+        suffix = old[end:]
+        if not new.startswith(old[:start]) or not new.endswith(suffix):
+            continue
+        value = new[start:len(new) - len(suffix)]
+        # One literal token only. Expressions, comments and changes to the signature
+        # must use the ordinary line map. Check token boundaries in the resulting line.
+        if not value or value == old[start:end]:
+            continue
+        try:
+            before = ast.literal_eval(old[start:end])
+            after = ast.parse(value, mode="eval").body
+            if isinstance(after, ast.Constant) and type(after.value) is type(before):
+                if ast.get_source_segment(value, after) == value:
+                    return mask
+        except (SyntaxError, ValueError):
+            pass
+    return None
+
+
 def is_trivial(removed, added, gap, spans, bslash, pure_enums=None) -> bool:
     """Only comments / blank lines changed (outside strings, not after a backslash), or an
     identity test swapped for an equality test that means the same (see same_meaning)."""
@@ -215,9 +247,11 @@ class Selector:
         to_number = [number_of.get(tid) for tid in cmap["tests"]]
         self.sets = [[to_number[i] for i in s if to_number[i] is not None] for s in cmap["sets"]]
         self.impact = cmap["impact"]
+        self.literal_reads = cmap.get("literal_reads", {})
         self.strs = cmap["strs"]
         self.bslash = {p: set(v) for p, v in cmap["bslash"].items()}
         self.opens = cmap["opens"]
+        self.fixture_fields = cmap.get("fixture_fields", {})
         self.tspans = cmap["tspans"]
         self.timport = cmap.get("timport", {})
         self.pure_enums = frozenset(cmap.get("pure_enums", []))
@@ -231,7 +265,20 @@ class Selector:
 
     def select(self, patch_text: str):
         chosen: set[int] = set()
-        for old_path, new_path, hunks in parse_patch(patch_text):
+        files = parse_patch(patch_text)
+        if len(files) == 1:
+            old, new, hunks = files[0]
+            rows = self.literal_reads.get(old)
+            if old == new and rows:
+                changes = [seg for start, lines in hunks for seg in segments(start, lines)]
+                if len(changes) == 1:
+                    removed, added, _ = changes[0]
+                    if len(removed) == len(added) == 1:
+                        n, original = removed[0]
+                        mask = literal_mask(rows.get(str(n), ()), original, added[0])
+                        if mask is not None:
+                            return set(self.sets[mask]).union(self.unmapped)
+        for old_path, new_path, hunks in files:
             result = self.select_file(old_path, new_path, hunks)
             if result is ALL:
                 return ALL
@@ -254,6 +301,9 @@ class Selector:
             return ALL  # deleting a module or fixture
         if new_path != old_path and in_suite:
             return ALL  # a renamed module or fixture is gone from where it was imported
+        if in_suite and path.endswith(".py"):
+            if any(reindented(r, a) for start, lines in hunks for r, a, _ in segments(start, lines)):
+                return ALL
         if path.endswith(".py") and path.startswith("sqlglot/"):
             return self.select_source(path, hunks)
         if path.startswith("tests/"):
@@ -324,7 +374,27 @@ class Selector:
                         out.update(owner)
             return out
         index = self.opens.get(path)
-        return self.sets[index] if index is not None else ()
+        if index is None:
+            return ()
+        readers = self.sets[index]
+        if path not in self.fixture_fields or not hunks:
+            return readers
+        roles, omitted = self.fixture_fields[path]
+        unused = set(readers)
+        for start, lines in hunks:
+            for removed, added, _ in segments(start, lines):
+                if not removed or len(removed) != len(added):
+                    return readers
+                for (n, old), new in zip(removed, added):
+                    # Preserve the loader's statement delimiters, comment filtering
+                    # and metadata prefix. Only replace ordinary SQL within a field.
+                    if not 1 <= n <= len(roles) or roles[n - 1] == "0":
+                        return readers
+                    if any(not t.strip() or t.lstrip().startswith(("#", "--")) or ";" in t
+                           or t.splitlines() != [t] or "\x00" in t for t in (old, new)):
+                        return readers
+                    unused.intersection_update(self.sets[omitted[int(roles[n - 1])]])
+        return set(readers) - unused
 
     def has_real_change(self, hunks, path):
         strings = self.strs.get(path, [])

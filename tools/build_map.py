@@ -1,7 +1,10 @@
-"""Build data/covmap.json.gz from two per-test coverage runs and sqlglot's pinned source.
+"""Build data/covmap.json.gz from pinned sqlglot sources and per-test coverage.
 
 Usage (repo root):
-    python3 tools/build_map.py sqlglot-src sample/tests.json build/lazy build/pre data/covmap.json.gz
+    python3 tools/build_map.py sqlglot-src sample/tests.json build/lazy build/pre-callbacks data/covmap.json.gz build/serial
+
+Generate the pre-imported profile with tools/run_coverage.sh pre-callbacks 1.
+Older profiles without call logs fall back to ordinary line coverage.
 
 Everything here is derived from the pinned commit only (coverage, fixture opens, source
 structure). Nothing looks at patches or answers.
@@ -12,6 +15,8 @@ changes", so the selector in the container only does lookups. Output layout:
   tests:  [test id, ...]                       test sets below index into this
   sets:   [[test index, ...], ...]             deduplicated; sets[0] is empty
   impact: {src path: [set index for line 1, line 2, ..., one past the last line]}
+  literal_reads: {path: {line: [(start column, end column, set index), ...]}}
+  fixture_fields: {path: [paired-SQL field for each line, unused reader sets per field]}
   strs:   {src path: [start, end, ...]}        multi-line string tokens (line spans)
   bslash: {src path: [line, ...]}              lines ending in a backslash continuation
   opens:  {data file under tests/: set index}  tests that open it
@@ -31,6 +36,12 @@ import sqlite3
 import sys
 import tokenize
 from collections import defaultdict
+from pathlib import Path
+
+if __package__:
+    from .fixture_reads import pair_readers
+else:
+    from fixture_reads import pair_readers
 
 FAMILY_DIRS = ("dialects", "parsers", "generators", "typing")
 # A name assigned in more places than this is polymorphic (arg_types, FUNCTIONS, ...):
@@ -96,7 +107,48 @@ def load_run(run_dir, index_of, by_class):
             for key in keys:
                 built[key.rsplit(":", 1)[1].rsplit(".", 1)[-1]] |= mask
                 built[key] |= mask  # exact "module:qualname" as well
+
     return cov, imports, opens, built
+
+
+def call_profiles(run_dir, index_of, by_class, all_tests):
+    """Only narrow when the profiling logs cover every worker in the run."""
+    root = Path(run_dir)
+    workers = {p.name.removeprefix("opens-") for p in root.glob("opens-*.json")}
+
+    def complete(prefix):
+        return bool(workers) and all((root / (prefix + w)).is_file() for w in workers)
+
+    def read(prefix):
+        masks = defaultdict(int)
+        for worker in workers:
+            with (root / (prefix + worker)).open() as f:
+                for context, keys in json.load(f).items():
+                    nodeid, _, phase = context.rpartition("|")
+                    nodeid = nodeid.split("[", 1)[0]
+                    if not context:
+                        mask = all_tests
+                    elif phase == "run":
+                        mask = 1 << index_of[nodeid]
+                    else:
+                        mask = by_class[nodeid.rsplit("::", 1)[0]]
+                    for key in keys:
+                        masks[key] |= mask
+        return masks
+
+    defaults = {}
+    if complete("defaults-") and complete("monitored-"):
+        watched = None
+        for worker in workers:
+            if worker == "main.json" and len(workers) > 1:
+                continue  # the xdist controller runs no tests
+            with (root / ("monitored-" + worker)).open() as f:
+                keys = set(json.load(f))
+            watched = keys if watched is None else watched & keys
+        used = read("defaults-")
+        defaults = {key: used[key] for key in watched or ()}
+    callbacks = read("lambdas-") if complete("lambdas-") else None
+    return defaults, callbacks
 
 
 # --------------------------------------------------------------------------- source
@@ -233,6 +285,7 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
 
     cov_lazy, imp_lazy, opens_lazy, built_lazy = load_run(lazy_dir, index_of, by_class)
     cov_pre, imp_pre, opens_pre, built_pre = load_run(pre_dir, index_of, by_class)
+    default_use, callbacks = call_profiles(pre_dir, index_of, by_class, all_tests)
     built = defaultdict(int)
     for d in (built_lazy, built_pre):
         for name, mask in d.items():
@@ -589,6 +642,7 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
         escalate_cache[key] = m
         return m
 
+    literal_reads = defaultdict(lambda: defaultdict(list))
     impact = {}
     strs = {}
     bslash = {}
@@ -757,6 +811,50 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
             imp = imp_pre.get(path, set())
             return any(line in imp for line in range(func.body[0].lineno, func.end_lineno + 1))
 
+        # These spans describe literals in the pinned source, independent of any diff.
+        # Keep the normal line mask separately for renames, insertions and other edits.
+        lines = text.splitlines()
+        def add_literal(value, mask):
+            if not isinstance(value, ast.Constant) or type(value.value) not in (bool, int, float, str):
+                return
+            if value.lineno != value.end_lineno:
+                return
+            raw = lines[value.lineno - 1].encode()
+            start = len(raw[:value.col_offset].decode())
+            end = len(raw[:value.end_col_offset].decode())
+            literal_reads[rel][value.lineno].append((start, end, mask | nocov))
+
+        # Direct dictionary callbacks remain inert until called. Restrict the narrower
+        # mask to literals in their bodies, leaving keys and lambda defaults alone.
+        dict_callbacks = {v for d in ast.walk(trees[rel]) if isinstance(d, ast.Dict)
+                          for k, v in zip(d.keys, d.values)
+                          if isinstance(k, ast.Constant) and isinstance(v, ast.Lambda)}
+        for node in ast.walk(trees[rel]):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = node.args
+                pairs = list(zip(reversed(args.posonlyargs + args.args), reversed(args.defaults)))
+                pairs.extend(zip(args.kwonlyargs, args.kw_defaults))
+                for arg, value in pairs:
+                    if not isinstance(value, ast.Constant):
+                        continue
+                    key = f"{rel}|{node.name}|{first_line(node)}|{arg.arg}"
+                    if key in default_use:
+                        mask = default_use[key]
+                        if _runs_at_import(rel, node):
+                            mask |= import_exec_tests(rel, node)
+                        add_literal(value, mask)
+            elif node in dict_callbacks and callbacks is not None:
+                if node.lineno != node.end_lineno or node.lineno in order_dependent[rel]:
+                    continue
+                key = f"{rel}|{node.lineno}"
+                mask = callbacks.get(key, 0)
+                if mask == all_tests:
+                    continue
+                # Pre-imported line coverage also covers code sharing this physical line.
+                mask |= cov_pre.get(rel, {}).get(node.lineno, 0)
+                for value in ast.walk(node.body):
+                    add_literal(value, mask)
+
         per_line = []
         for line in range(1, n_lines + 2):
             unit = owner[line] if line <= n_lines else None
@@ -805,6 +903,17 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
         if mask:
             timport[target] = mask
 
+    # A direct open in a test retains the whole-file dependency even when its
+    # class also materializes paired SQL in setUpClass.
+    direct_opens = defaultdict(int)
+    for directory in (lazy_dir, pre_dir):
+        for log in glob.glob(os.path.join(directory, "opens-*.json")):
+            for context, paths in json.load(open(log)).items():
+                tid, _, phase = context.rpartition("|")
+                if phase == "run" and tid in index_of:
+                    for path in paths:
+                        direct_opens[path] |= 1 << index_of[tid]
+    fixture_fields = {}
     tspans = {}
     for path in sorted(glob.glob(os.path.join(src, "tests", "**", "test_*.py"), recursive=True)):
         rel = os.path.relpath(path, src)
@@ -817,6 +926,11 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
             strs[rel] = spans
         if bs:
             bslash[rel] = bs
+        for path, roles, omitted in pair_readers(tree, rel, index_of, src):
+            if path not in fixture_fields:
+                fixture_fields[path] = (roles, [0, 0, 0])
+            for field in (1, 2):
+                fixture_fields[path][1][field] |= omitted[field] & ~direct_opens[path]
         flat = []
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
@@ -873,8 +987,12 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
         "tests": test_ids,
         "sets": sets,
         "impact": {p: [intern(m) for m in v] for p, v in impact.items()},
+        "literal_reads": {p: {n: [(a, b, intern(m)) for a, b, m in spans]
+                               for n, spans in rows.items()} for p, rows in literal_reads.items()},
         "strs": strs,
         "bslash": bslash,
+        "fixture_fields": {p: ["".join(map(str, roles)), [intern(m) for m in omitted]]
+                           for p, (roles, omitted) in fixture_fields.items()},
         "opens": {p: intern(m) for p, m in sorted(opens.items())},
         "tspans": {p: [x for s, e, m in v for x in (s, e, intern(m))] for p, v in tspans.items()},
         "timport": {p: intern(m) for p, m in sorted(timport.items())},

@@ -85,10 +85,119 @@ _classes: dict[str, set] = {}
 _current_classes: set = _classes.setdefault("", set())
 
 
+# Default-argument use: (function, parameter) pairs whose default value a test relied on.
+# Changing "flag: bool = False" can only affect calls that did not pass flag; a call whose
+# value merely equals the default is counted too (we cannot tell it apart), so this errs
+# on the safe side.
+_defaults: dict[str, set] = {}
+_current_defaults: set = _defaults.setdefault("", set())
+_MISSING = object()
+
+
 def _set_context(context):
-    global _current, _current_classes
+    global _current, _current_classes, _current_defaults
     _current = context
     _current_classes = _classes.setdefault(context, set())
+    _current_defaults = _defaults.setdefault(context, set())
+    if _monitoring_on:
+        sys.monitoring.restart_events()  # re-arm callbacks disabled during the last test
+
+
+_monitoring_on = False
+_TOOL = 4
+_monitored: dict = {}
+_lambda_calls: dict[str, set[str]] = {}
+
+
+def _record_lambda_calls():
+    # Start before collection imports sqlglot. A lambda called during collection
+    # has an empty context and cannot be narrowed using per-test calls.
+    mon = sys.monitoring
+    tool = 3
+    mon.use_tool_id(tool, "covmap-lambdas")
+
+    def on_start(code, offset):
+        if code.co_name == "<lambda>" and code.co_filename.startswith(_ROOT + os.sep):
+            path = os.path.relpath(code.co_filename, _ROOT)
+            _lambda_calls.setdefault(_current, set()).add(f"{path}|{code.co_firstlineno}")
+        return mon.DISABLE
+
+    mon.register_callback(tool, mon.events.PY_START, on_start)
+    mon.set_events(tool, mon.events.PY_START)
+
+
+if os.environ.get("COVMAP_PREIMPORT") == "1":
+    _record_lambda_calls()
+
+
+def _record_default_use():
+    """Watch the entry of every sqlglot function that has simple literal defaults."""
+    global _monitoring_on
+    import inspect
+    import types
+
+    specs = {}
+
+    def add(func):
+        func = getattr(func, "__func__", func)
+        if not isinstance(func, types.FunctionType):
+            return
+        code = func.__code__
+        if code in specs or not code.co_filename.startswith(_ROOT):
+            return
+        params = []
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            return
+        for p in signature.parameters.values():
+            d = p.default
+            if d is not inspect.Parameter.empty and (d is None or isinstance(d, (bool, int, float, str))):
+                params.append((p.name, d))
+        if params:
+            key = f"{os.path.relpath(code.co_filename, _ROOT)}|{code.co_name}|{code.co_firstlineno}"
+            specs[code] = (key, params)
+
+    def walk(obj, seen):
+        for value in list(vars(obj).values()):
+            if isinstance(value, property):
+                for f in (value.fget, value.fset):
+                    if f:
+                        add(f)
+            elif isinstance(value, type) and value.__module__.startswith("sqlglot") and value not in seen:
+                seen.add(value)
+                walk(value, seen)
+            else:
+                add(value)
+
+    seen: set = set()
+    for name, module in list(sys.modules.items()):
+        if name == "sqlglot" or name.startswith("sqlglot."):
+            walk(module, seen)
+
+    mon = sys.monitoring
+    mon.use_tool_id(_TOOL, "covmap-defaults")
+
+    def on_start(code, offset):
+        key, params = specs[code]
+        local = sys._getframe(1).f_locals
+        done = True
+        for name, default in params:
+            entry = (key, name)
+            if entry in _current_defaults:
+                continue
+            value = local.get(name, _MISSING)
+            if value is default or (type(value) is type(default) and value == default):
+                _current_defaults.add(entry)
+            else:
+                done = False
+        return mon.DISABLE if done else None
+
+    _monitored.update(specs)
+    mon.register_callback(_TOOL, mon.events.PY_START, on_start)
+    for code in specs:
+        mon.set_local_events(_TOOL, code, mon.events.PY_START)
+    _monitoring_on = True
 
 
 def _record_expression_classes():
@@ -132,6 +241,8 @@ def pytest_collection(session):
             except Exception:  # noqa: BLE001 - optional modules
                 pass
     _record_expression_classes()
+    if os.environ.get("COVMAP_PREIMPORT") == "1":
+        _record_default_use()  # needs every module loaded first
     return None
 
 
@@ -154,8 +265,15 @@ def pytest_runtest_logfinish(nodeid, location):
 def pytest_sessionfinish(session):
     os.makedirs(_OUT, exist_ok=True)
     worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    if os.environ.get("COVMAP_PREIMPORT") == "1":
+        with open(os.path.join(_OUT, f"lambdas-{worker}.json"), "w") as f:
+            json.dump({k: sorted(v) for k, v in _lambda_calls.items()}, f)
     with open(os.path.join(_OUT, f"opens-{worker}.json"), "w") as f:
         json.dump({k: sorted(v) for k, v in _opens.items()}, f)
+    with open(os.path.join(_OUT, f"monitored-{worker}.json"), "w") as f:
+        json.dump(sorted(f"{key}|{name}" for key, params in _monitored.values() for name, _ in params), f)
+    with open(os.path.join(_OUT, f"defaults-{worker}.json"), "w") as f:
+        json.dump({k: sorted(f"{key}|{name}" for key, name in v) for k, v in _defaults.items() if v}, f)
     with open(os.path.join(_OUT, f"classes-{worker}.json"), "w") as f:
         json.dump({k: sorted(f"{c.__module__}:{c.__qualname__}" for c in v)
                    for k, v in _classes.items() if v}, f)

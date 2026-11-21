@@ -22,8 +22,8 @@ if [ ! -x /work/.covenv/bin/python ]; then
   python -m venv /work/.covenv
   /work/.covenv/bin/pip install -q -r /work/requirements.lock coverage pytest-cov
 fi
-rm -f "$COVMAP_OUT"/.coverage* "$COVMAP_OUT"/opens-*.json "$COVMAP_OUT"/classes-*.json
+rm -f "$COVMAP_OUT"/.coverage* "$COVMAP_OUT"/opens-*.json "$COVMAP_OUT"/classes-*.json "$COVMAP_OUT"/defaults-*.json "$COVMAP_OUT"/monitored-*.json "$COVMAP_OUT"/lambdas-*.json
 export SKIP_INTEGRATION=0 COVMAP_ROOT=/src PYTHONPATH=/src:/work/tools PYTHONDONTWRITEBYTECODE=1
 /work/.covenv/bin/python -m pytest tests -p covplugin -p no:cacheprovider \
-  -n ${WORKERS} --cov=sqlglot --cov-context=test --cov-report= -q 2>&1 | tail -3
+  -n ${WORKERS} --cov=sqlglot --cov-context=test --cov-report= -q
 '
