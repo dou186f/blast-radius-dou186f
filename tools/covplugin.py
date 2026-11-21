@@ -78,45 +78,66 @@ def _audit(event, args):
 sys.addaudithook(_audit)
 
 
+# Expression classes each test instantiates. Class bodies (arg_types, is_var_len_args...)
+# run once at import, so line coverage cannot tell which test depends on them; a test
+# can only be affected by a class-level setting of a class it builds objects of.
+_classes: dict[str, set] = {}
+_current_classes: set = _classes.setdefault("", set())
+
+
+def _set_context(context):
+    global _current, _current_classes
+    _current = context
+    _current_classes = _classes.setdefault(context, set())
+
+
+def _record_expression_classes():
+    from sqlglot.expressions.core import Expr
+
+    original = Expr.__init__
+
+    def __init__(self, **args):
+        _current_classes.add(self.__class__)
+        original(self, **args)
+
+    Expr.__init__ = __init__
+
+
 def pytest_collection(session):
     """With COVMAP_PREIMPORT=1, import every sqlglot module before any test runs, so
     import-time lines (class bodies, module constants) land in the empty context instead
     of being charged to whichever test happened to lazy-load a dialect first."""
-    if os.environ.get("COVMAP_PREIMPORT") != "1":
-        return None
-    import importlib
-    import pkgutil
+    if os.environ.get("COVMAP_PREIMPORT") == "1":
+        import importlib
+        import pkgutil
 
-    import sqlglot
+        import sqlglot
 
-    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
-        if info.name == "sqlglot.__main__":
-            continue
-        try:
-            importlib.import_module(info.name)
-        except Exception:  # noqa: BLE001 - optional modules
-            pass
+        for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+            if info.name == "sqlglot.__main__":
+                continue
+            try:
+                importlib.import_module(info.name)
+            except Exception:  # noqa: BLE001 - optional modules
+                pass
+    _record_expression_classes()
     return None
 
 
 def pytest_runtest_setup(item):
-    global _current
-    _current = item.nodeid + "|setup"
+    _set_context(item.nodeid + "|setup")
 
 
 def pytest_runtest_call(item):
-    global _current
-    _current = item.nodeid + "|run"
+    _set_context(item.nodeid + "|run")
 
 
 def pytest_runtest_teardown(item):
-    global _current
-    _current = item.nodeid + "|teardown"
+    _set_context(item.nodeid + "|teardown")
 
 
 def pytest_runtest_logfinish(nodeid, location):
-    global _current
-    _current = ""
+    _set_context("")
 
 
 def pytest_sessionfinish(session):
@@ -124,3 +145,6 @@ def pytest_sessionfinish(session):
     worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
     with open(os.path.join(_OUT, f"opens-{worker}.json"), "w") as f:
         json.dump({k: sorted(v) for k, v in _opens.items()}, f)
+    with open(os.path.join(_OUT, f"classes-{worker}.json"), "w") as f:
+        json.dump({k: sorted(f"{c.__module__}:{c.__qualname__}" for c in v)
+                   for k, v in _classes.items() if v}, f)

@@ -82,7 +82,15 @@ def load_run(run_dir, index_of, by_class):
             for p in paths:
                 if "__pycache__" not in p:
                     opens[p] |= mask
-    return cov, imports, opens
+
+    # "sqlglot.expressions.aggregate:Last" -> tests that built a Last object
+    built = defaultdict(int)
+    for log in glob.glob(os.path.join(run_dir, "classes-*.json")):
+        for context, keys in json.load(open(log)).items():
+            mask = charged(context) or 0
+            for key in keys:
+                built[key.rsplit(":", 1)[1].rsplit(".", 1)[-1]] |= mask
+    return cov, imports, opens, built
 
 
 # --------------------------------------------------------------------------- source
@@ -217,8 +225,12 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
         by_file[t["file"]] |= 1 << i
     all_tests = (1 << len(tests)) - 1
 
-    cov_lazy, imp_lazy, opens_lazy = load_run(lazy_dir, index_of, by_class)
-    cov_pre, imp_pre, opens_pre = load_run(pre_dir, index_of, by_class)
+    cov_lazy, imp_lazy, opens_lazy, built_lazy = load_run(lazy_dir, index_of, by_class)
+    cov_pre, imp_pre, opens_pre, built_pre = load_run(pre_dir, index_of, by_class)
+    built = defaultdict(int)
+    for d in (built_lazy, built_pre):
+        for name, mask in d.items():
+            built[name] |= mask
 
     # Runtime coverage: the pre-imported run is clean; the lazy run adds what lazy
     # imports exercise, minus its noise on lines that really run at import time.
@@ -289,14 +301,34 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
             if b in class_to_dialect and class_to_dialect[b] != class_to_dialect[cls]:
                 children[class_to_dialect[b]].add(class_to_dialect[cls])
 
-    def descendants(name):
+    def descendants(name, graph=children):
         seen, todo = {name}, [name]
         while todo:
-            for c in children[todo.pop()]:
+            for c in graph[todo.pop()]:
                 if c not in seen:
                     seen.add(c)
                     todo.append(c)
         return seen
+
+    # ---- every class in sqlglot -> its subclasses (by name), for "who built this class"
+    subclasses = defaultdict(set)
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for b in node.bases:
+                    base = b.id if isinstance(b, ast.Name) else getattr(b, "attr", None)
+                    if base:
+                        subclasses[base].add(node.name)
+    built_cache = {}
+
+    def built_tests(class_name):
+        """Tests that built an object of this class or of any subclass of it."""
+        if class_name not in built_cache:
+            m = 0
+            for c in descendants(class_name, subclasses):
+                m |= built.get(c, 0)
+            built_cache[class_name] = m
+        return built_cache[class_name]
 
     def family_tests(dialect):
         m = 0
@@ -340,6 +372,13 @@ def main(src, tests_json, lazy_dir, pre_dir, out):
                 family_cache[dialect] = family_tests(dialect)
             m |= family_cache[dialect]
         m |= usage_tests(names | set(unit.classes[-1:]), rel, unit.start, unit.end)
+        # a class-level setting (arg_types, is_var_len_args, ...) or a class header can only
+        # reach tests that build objects of that class or of one of its subclasses
+        owners = list(unit.classes[-1:])
+        if isinstance(unit.node, ast.ClassDef):
+            owners.append(unit.node.name)
+        for owner in owners:
+            m |= built_tests(owner)
         if not dialect and not (m & ~nocov):
             # nothing specific found: everything that runs the enclosing class or file
             m |= file_cov.get(rel, 0)
