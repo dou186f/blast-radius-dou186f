@@ -50,7 +50,7 @@ def run_one(src, val, cid, uid):
     # Hard memory cap per container and no swap: a run that needs more is killed inside
     # its own container instead of taking the whole machine down (TPC-DS tests copy their
     # tables into every pool process). The cgroup's peak usage is reported afterwards.
-    pytest = ("/work/.covenv/bin/python -m pytest tests -p failplugin -p no:cacheprovider "
+    pytest = (f"/work/.covenv/bin/python -m pytest {TESTS} -p failplugin -p no:cacheprovider "
               f"-p no:pytest_cov -n {WORKERS} --timeout 240 -q >/dev/null 2>&1; "
               "cat /sys/fs/cgroup/memory.peak")
     cmd = [
@@ -76,6 +76,8 @@ def run_one(src, val, cid, uid):
 MEMORY = os.environ.get("LABEL_MEMORY", "6g")
 WORKERS = int(os.environ.get("LABEL_WORKERS", "6"))
 POOL = int(os.environ.get("LABEL_POOL", "2"))
+# LABEL_TESTS="tests/test_executor.py::TestExecutor::test_execute_tpcds" labels one test only
+TESTS = os.environ.get("LABEL_TESTS", "tests")
 
 
 def main(src, tests_json, val, parallel=2):

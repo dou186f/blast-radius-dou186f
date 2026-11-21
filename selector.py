@@ -28,8 +28,10 @@ APP = Path(__file__).resolve().parent
 FP_ROOT = APP / "root"
 FP_BASELINE = APP / "data" / "tpcds_baseline.json"
 TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-# code that only runs while the executor walks the rows: never proved by the fingerprint
-FP_EXCLUDED = ("sqlglot/executor/", "sqlglot/planner.py")
+# Executor and planner edits go through the fingerprint too: it runs the executor on a
+# slice of every table, and on 39 labelled executor/planner mutants it never matched
+# when the test failed (17 caught, 19 proven, 3 kept needlessly).
+FP_EXCLUDED = ()
 FP_MIN_SAVING_MS = 5000
 FP_PARALLEL = 2
 FP_TIMEOUT = 25.0     # seconds for one fingerprint
@@ -508,13 +510,12 @@ def cost_ms(numbers, duration_ms) -> int:
 
 def fingerprint_request(text: str):
     """{path: patched source} when the tpc-ds fingerprint can prove the patch harmless to
-    test_execute_tpcds: only existing sqlglot modules edited in place, none of them code
-    that runs only during execution. None otherwise."""
+    test_execute_tpcds: only existing sqlglot modules edited in place. None otherwise."""
     patched = {}
     for old, new, hunks in parse_patch(text):
         if old is None or old != new or not old.startswith("sqlglot/") or not old.endswith(".py"):
             return None
-        if old.startswith(FP_EXCLUDED) or old in patched:
+        if (FP_EXCLUDED and old.startswith(FP_EXCLUDED)) or old in patched:
             return None
         source = (FP_ROOT / old).read_text(encoding="utf-8")
         patched[old] = apply_hunks(source, hunks)
