@@ -83,7 +83,12 @@ def parse_patch(text: str):
                 raise ValueError("bad hunk header")
             old_left = int(m.group(2)) if m.group(2) is not None else 1
             new_left = int(m.group(4)) if m.group(4) is not None else 1
-            current[2].append((int(m.group(1)), []))
+            start = int(m.group(1))
+            if old_left == 0:
+                # an empty old range ("-17,0", diff -U0 insertions) names the line BEFORE
+                # the insertion; with context it names the first line of the hunk
+                start += 1
+            current[2].append((start, []))
     return [(old, new, hunks) for old, new, hunks, _ in files]
 
 
@@ -222,9 +227,15 @@ class Selector:
                     lines_hit = [n for n, _ in removed]
                 else:
                     lines_hit = [gap, gap + 1]
+                found: set[int] = set()
                 for n in lines_hit:
                     n = min(max(n, 1), last)
-                    out.update(self.sets[impact[n - 1]])
+                    found.update(self.sets[impact[n - 1]])
+                if not found and not removed:
+                    # real code inserted where neither neighbour maps to any test (module or
+                    # class level, between definitions): it may run at import, be safe
+                    return ALL
+                out.update(found)
                 out.update(self.unmapped)
         return out
 
