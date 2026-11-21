@@ -9,9 +9,11 @@ Standard library only; stdout carries answers only, logs go to stderr.
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import re
 import sys
+import tokenize
 from pathlib import Path
 
 DATA = Path("/data")
@@ -137,6 +139,49 @@ def code_part(text: str) -> str:
     return text.rstrip()
 
 
+def same_meaning(text: str, enums) -> str:
+    """Token-normalised form of one line where an identity test against None or an enum
+    member ("x is None", "t is TokenType.L_PAREN", with or without "not") is written as the
+    equivalent equality test. Works on Python tokens, so string contents are never touched;
+    "is" against anything else (True/False, arbitrary objects, calls like E.M.into_expr())
+    is left as is. A line that does not tokenize is returned unchanged (not equivalent)."""
+    try:
+        toks = [t for t in tokenize.generate_tokens(io.StringIO(text.strip()).readline)
+                if t.type not in (tokenize.NEWLINE, tokenize.NL, tokenize.ENDMARKER,
+                                  tokenize.INDENT, tokenize.DEDENT, tokenize.COMMENT)]
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return text
+    out = []
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        if tok.type == tokenize.NAME and tok.string == "is":
+            negated = i + 1 < len(toks) and toks[i + 1].string == "not"
+            j = i + 2 if negated else i + 1
+            # right-hand side: None, or a dotted name whose last-but-one part is an enum
+            k = j
+            parts = []
+            while k < len(toks) and toks[k].type == tokenize.NAME:
+                parts.append(toks[k].string)
+                if k + 1 < len(toks) and toks[k + 1].string == "." and k + 2 < len(toks) \
+                        and toks[k + 2].type == tokenize.NAME:
+                    k += 2
+                else:
+                    k += 1
+                    break
+            following = toks[k].string if k < len(toks) else ""
+            plain_end = following not in (".", "(", "[")
+            is_none = parts == ["None"]
+            is_member = enums is not None and len(parts) >= 2 and parts[-2] in enums
+            if plain_end and (is_none or is_member):
+                out.append("!=" if negated else "==")
+                i = j
+                continue
+        out.append(tok.string)
+        i += 1
+    return " ".join(out)
+
+
 def in_string(spans, line: int) -> bool:
     """True when `line` starts inside a multi-line string token."""
     for i in range(0, len(spans), 2):
@@ -145,8 +190,9 @@ def in_string(spans, line: int) -> bool:
     return False
 
 
-def is_trivial(removed, added, gap, spans, bslash) -> bool:
-    """Only comments / blank lines changed, outside strings, not after a backslash."""
+def is_trivial(removed, added, gap, spans, bslash, pure_enums=None) -> bool:
+    """Only comments / blank lines changed (outside strings, not after a backslash), or an
+    identity test swapped for an equality test that means the same (see same_meaning)."""
     if any(in_string(spans, n) for n, _ in removed):
         return False
     first = removed[0][0] if removed else gap + 1
@@ -154,7 +200,11 @@ def is_trivial(removed, added, gap, spans, bslash) -> bool:
         return False
     old_code = [c for c in (code_part(t) for _, t in removed) if c.strip()]
     new_code = [c for c in (code_part(t) for t in added) if c.strip()]
-    return old_code == new_code
+    if old_code == new_code:
+        return True
+    if len(old_code) != len(new_code):
+        return False
+    return [same_meaning(c, pure_enums) for c in old_code] == [same_meaning(c, pure_enums) for c in new_code]
 
 
 # --------------------------------------------------------------------------- select
@@ -170,6 +220,7 @@ class Selector:
         self.opens = cmap["opens"]
         self.tspans = cmap["tspans"]
         self.timport = cmap.get("timport", {})
+        self.pure_enums = frozenset(cmap.get("pure_enums", []))
         self.nocov = self.sets[cmap["nocov"]]
         self.by_file: dict[str, list[int]] = {}
         for t in tests:
@@ -221,7 +272,7 @@ class Selector:
         last = len(impact)
         for start, lines in hunks:
             for removed, added, gap in segments(start, lines):
-                if is_trivial(removed, added, gap, spans, bslash):
+                if is_trivial(removed, added, gap, spans, bslash, self.pure_enums):
                     continue
                 if removed:
                     lines_hit = [n for n, _ in removed]

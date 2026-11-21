@@ -738,7 +738,36 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
             sets.append([i for i in range(len(tests)) if mask >> i & 1])
         return set_index[mask]
 
+    # Enums whose members compare by identity only (no str/int mixin): for them
+    # "x is E.M" and "x == E.M" mean the same, which the selector uses to drop such edits.
+    class_bases = defaultdict(list)
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                class_bases[node.name].append(
+                    [b.id if isinstance(b, ast.Name) else getattr(b, "attr", "?") for b in node.bases])
+
+    def enum_kind(name, seen=()):
+        if name in ("Enum", "Flag"):
+            return "pure"
+        if name in ("IntEnum", "StrEnum", "IntFlag", "str", "int", "float", "bytes"):
+            return "mixed"
+        if name not in class_bases or name in seen:
+            return None
+        kinds = []
+        for bases in class_bases[name]:
+            ks = [enum_kind(b, seen + (name,)) for b in bases]
+            if "pure" in ks or "mixed" in ks:
+                kinds.append("mixed" if "mixed" in ks or None in ks else "pure")
+        if not kinds:
+            return None
+        return "mixed" if "mixed" in kinds else "pure"
+
+    pure_enums = sorted(n for n in class_bases if enum_kind(n) in ("pure", "mixed")
+                        and n not in ("Enum", "Flag"))
+
     result = {
+        "pure_enums": pure_enums,
         "tests": test_ids,
         "sets": sets,
         "impact": {p: [intern(m) for m in v] for p, v in impact.items()},
