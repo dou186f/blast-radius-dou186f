@@ -642,27 +642,40 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
             return element_cache[key]
 
         def entry_classes(nodes):
-            """Expression classes an entry is about: its dict key when that is a class
-            (TRANSFORMS: exp.Foo -> ...) and the outermost class it builds ("SHA2": lambda
-            args: exp.SHA2(..., exp.Literal.number(512)) -> SHA2, not Literal)."""
+            """Expression classes an entry is about: every class it calls or references,
+            except ones nested inside another expression constructor's arguments.
+              "SHA2": lambda args: exp.SHA2(..., exp.Literal.number(512))  -> {SHA2}
+              "DATE_ADD": build_date_delta(exp.DateAdd)                     -> {DateAdd}
+              exp.Foo: lambda self, e: ...  (TRANSFORMS key)                -> {Foo}"""
             found = set()
-            for node in nodes:
+
+            def class_in(node):
+                while isinstance(node, ast.Attribute):
+                    if node.attr in expr_classes:
+                        return node.attr
+                    node = node.value
+                if isinstance(node, ast.Name) and node.id in expr_classes:
+                    return node.id
+                return None
+
+            def visit(node, inside):
+                if isinstance(node, ast.Call):
+                    cls = class_in(node.func)
+                    if cls and not inside:
+                        found.add(cls)
+                    for arg in list(node.args) + [k.value for k in node.keywords]:
+                        visit(arg, inside or cls is not None)
+                    return
                 if isinstance(node, (ast.Attribute, ast.Name)):
-                    name = node.attr if isinstance(node, ast.Attribute) else node.id
-                    if name in expr_classes:
-                        found.add(name)
-                        continue
-                for sub in ast.walk(node):
-                    if isinstance(sub, ast.Call):
-                        func = sub.func
-                        while isinstance(func, ast.Attribute):
-                            if func.attr in expr_classes:
-                                break
-                            func = func.value
-                        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-                        if name in expr_classes:
-                            found.add(name)
-                            break
+                    cls = class_in(node)
+                    if cls and not inside:
+                        found.add(cls)
+                    return
+                for child in ast.iter_child_nodes(node):
+                    visit(child, inside)
+
+            for node in nodes:
+                visit(node, False)
             return found
 
         def import_line_tests(unit, line):
