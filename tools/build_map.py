@@ -390,6 +390,34 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
           file=sys.stderr)
 
     family_cache = {}
+    users_cache = {}
+
+    def dialect_users(dialect):
+        """Tests that built an object of this dialect (or a descendant) at all."""
+        if dialect not in users_cache:
+            m = 0
+            for d in descendants(dialect):
+                for folder in ("dialects", "parsers", "generators"):
+                    tree = trees.get(f"sqlglot/{folder}/{d}.py")
+                    for node in tree.body if tree else []:
+                        if isinstance(node, ast.ClassDef):
+                            m |= built.get(f"sqlglot.{folder}.{d}:{node.name}", 0)
+            users_cache[dialect] = m & ~sweepers
+        return users_cache[dialect]
+
+    def runtime_readers(names, skip_path, skip_start, skip_end):
+        """Coverage of every place that reads these names at run time, or None when a read
+        happens while modules load (the value may be copied elsewhere) or none is found."""
+        m, found = 0, False
+        for n in names:
+            for path, line in usages.get(n, ()):
+                if path == skip_path and skip_start <= line <= skip_end:
+                    continue
+                if line in imp_pre.get(path, ()):
+                    return None
+                found = True
+                m |= cov.get(path, {}).get(line, 0)
+        return m if found else None
 
     def dialect_of(rel):
         parts = rel.split("/")
@@ -436,6 +464,8 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
         if not dialect and not (m & ~nocov):
             # nothing specific found: everything that runs the enclosing class or file
             m |= file_cov.get(rel, 0)
+        if dialect:
+            m &= ~sweepers  # see the sweeper note: settings of one dialect never broke them
         return m
 
     reader_cache = {}
@@ -645,6 +675,15 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
             expr_body = (rel.startswith("sqlglot/expressions/") and bool(unit.classes)
                          and unit.classes[-1] in expr_classes)
             core = not dialect_of(rel) and not expr_body
+            dialect = dialect_of(rel)
+            if (dialect and unit.end == unit.start and unit.classes
+                    and isinstance(node, (ast.Assign, ast.AnnAssign))):
+                # a one-line dialect setting (TYPED_DIVISION = True) only matters to tests
+                # that use this dialect AND run code reading that setting
+                readers = runtime_readers(assigned_names(node), rel, unit.start, unit.end)
+                if readers is not None:
+                    return (dialect_users(dialect) & readers) | nocov | name_match_tests(rel) \
+                        | lines_cov(rel, unit.start, unit.end)
             if unit.end == unit.start or isinstance(node, (ast.Import, ast.ImportFrom)):
                 names = header_names(node)
                 m = unit_tests(unit) | lines_cov(rel, unit.start, unit.end) | usage_tests(
