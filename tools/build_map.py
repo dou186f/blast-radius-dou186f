@@ -392,6 +392,25 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
     family_cache = {}
     users_cache = {}
 
+    test_reads = defaultdict(int)  # name -> tests whose own code loads it
+    for path in sorted(glob.glob(os.path.join(src, "tests", "**", "test_*.py"), recursive=True)):
+        rel_t = os.path.relpath(path, src)
+        tree_t = ast.parse(open(path, encoding="utf-8").read())
+        spans_t = []
+        for node in tree_t.body:
+            if isinstance(node, ast.ClassDef):
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        tid = f"{rel_t}::{node.name}::{item.name}"
+                        if tid in index_of:
+                            spans_t.append((item.lineno, item.end_lineno, 1 << index_of[tid]))
+        for sub in ast.walk(tree_t):
+            name = sub.attr if isinstance(sub, ast.Attribute) else sub.id if isinstance(sub, ast.Name) else None
+            if name is None or not name.isupper():
+                continue
+            owner = [m for a, b, m in spans_t if a <= sub.lineno <= b]
+            test_reads[name] |= owner[0] if owner else by_file.get(rel_t, 0)
+
     def dialect_users(dialect):
         """Tests that built an object of this dialect (or a descendant) at all."""
         if dialect not in users_cache:
@@ -413,7 +432,7 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
             for path, line in usages.get(n, ()):
                 if path == skip_path and skip_start <= line <= skip_end:
                     continue
-                if line in imp_pre.get(path, ()):
+                if line in imp_pre.get(path, ()) or line in order_dependent.get(path, ()):
                     return None
                 found = True
                 m |= cov.get(path, {}).get(line, 0)
@@ -488,7 +507,11 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
                         if line in imp_pre.get(path, ()):
                             r = all_tests
                             break
+                        if line in order_dependent.get(path, ()):
+                            fn = function_at(path, line)
+                            r |= escalate(path, fn) if fn else all_tests
                         r |= cov.get(path, {}).get(line, 0)
+                r |= test_reads.get(n, 0)
                 reader_cache[key] = r
             m |= reader_cache[key]
         return m
@@ -695,8 +718,11 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
                 # that use this dialect AND run code reading that setting
                 readers = runtime_readers(assigned_names(node), rel, unit.start, unit.end)
                 if readers is not None:
-                    return (dialect_users(dialect) & readers) | nocov | name_match_tests(rel) \
-                        | lines_cov(rel, unit.start, unit.end)
+                    direct = 0
+                    for n in assigned_names(node):
+                        direct |= test_reads.get(n, 0)
+                    return (dialect_users(dialect) & readers) | direct | nocov \
+                        | name_match_tests(rel) | lines_cov(rel, unit.start, unit.end)
             if unit.end == unit.start or isinstance(node, (ast.Import, ast.ImportFrom)):
                 names = header_names(node)
                 m = unit_tests(unit) | lines_cov(rel, unit.start, unit.end) | usage_tests(
