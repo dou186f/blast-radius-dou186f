@@ -358,7 +358,7 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
         m = 0
         for d in descendants(dialect):
             for folder in FAMILY_DIRS:
-                m |= file_cov.get(f"sqlglot/{folder}/{d}.py", 0)
+                m |= file_cov.get(f"sqlglot/{folder}/{d}.py", 0) & ~sweepers
             m |= by_file.get(f"tests/dialects/test_{d}.py", 0)
             # tests that used this dialect at all, e.g. only as a validate_all write
             # target through shared Generator code (Drill.TYPED_DIVISION -> test_mysql)
@@ -611,6 +611,30 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
                 element_cache[key] = found
             return element_cache[key]
 
+        def entry_classes(nodes):
+            """Expression classes an entry is about: its dict key when that is a class
+            (TRANSFORMS: exp.Foo -> ...) and the outermost class it builds ("SHA2": lambda
+            args: exp.SHA2(..., exp.Literal.number(512)) -> SHA2, not Literal)."""
+            found = set()
+            for node in nodes:
+                if isinstance(node, (ast.Attribute, ast.Name)):
+                    name = node.attr if isinstance(node, ast.Attribute) else node.id
+                    if name in expr_classes:
+                        found.add(name)
+                        continue
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call):
+                        func = sub.func
+                        while isinstance(func, ast.Attribute):
+                            if func.attr in expr_classes:
+                                break
+                            func = func.value
+                        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                        if name in expr_classes:
+                            found.add(name)
+                            break
+            return found
+
         def import_line_tests(unit, line):
             """Impact of changing one line of an import-time statement."""
             node = unit.node
@@ -637,7 +661,7 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
                 for n in nodes:
                     names |= loaded_names(n)
                 m = unit_tests(unit) | lines_cov(rel, start, end) | usage_tests(names, rel, unit.start, unit.end)
-                for n in names:
+                for n in entry_classes(nodes):
                     m |= built_tests(n)
                 if core and not any(isinstance(sub, (ast.Lambda, ast.Call))
                                     for n in nodes for sub in ast.walk(n)):
