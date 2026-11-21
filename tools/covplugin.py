@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import ast
 import concurrent.futures
 import json
 import os
@@ -95,10 +96,11 @@ _MISSING = object()
 
 
 def _set_context(context):
-    global _current, _current_classes, _current_defaults
+    global _current, _current_classes, _current_defaults, _current_bool
     _current = context
     _current_classes = _classes.setdefault(context, set())
     _current_defaults = _defaults.setdefault(context, set())
+    _current_bool = _bool_seen.setdefault(context, {})
     if _monitoring_on:
         sys.monitoring.restart_events()  # re-arm callbacks disabled during the last test
 
@@ -126,7 +128,91 @@ def _record_lambda_calls():
     mon.set_events(tool, mon.events.PY_START)
 
 
-if os.environ.get("COVMAP_PREIMPORT") == "1":
+# Condition coverage (COVMAP_BOOLCOV=1, a separate run): see boolcov.py. Every sqlglot
+# module is compiled from a rewritten AST that records, per evaluation of an and/or
+# condition, the truth value of each operand it evaluated.
+_BOOLCOV = os.environ.get("COVMAP_BOOLCOV") == "1"
+_bool_seen: dict[str, dict[str, set]] = {}
+_current_bool: dict[str, set] = _bool_seen.setdefault("", {})
+_bool_stack: dict[str, list] = {}
+_bool_keys: set[str] = set()       # every instrumented condition
+_bool_broken: set[str] = set()     # conditions whose recording lost track (an exception)
+_bool_tainted: set[str] = set()    # contexts that ran code we cannot see (process, thread)
+
+
+def __bcov_begin__(key, n):
+    values = ["-"] * n
+    _bool_stack.setdefault(key, []).append(values)
+    return values
+
+
+def __bcov_leaf__(key, i, value):
+    stack = _bool_stack.get(key)
+    if stack:
+        stack[-1][i] = "T" if value else "F"
+    return value
+
+
+def __bcov_end__(key, values, result):
+    stack = _bool_stack[key]
+    if stack and stack[-1] is values:
+        stack.pop()
+    else:  # a leaf raised inside a nested evaluation of the same condition
+        _bool_broken.add(key)
+        if values in stack:
+            stack.remove(values)
+    seen = _current_bool.get(key)
+    if seen is None:
+        seen = _current_bool[key] = set()
+    seen.add("".join(values))
+    return result
+
+
+def _install_boolcov():
+    import builtins
+    import importlib.machinery
+
+    import boolcov
+
+    builtins.__bcov_begin__ = __bcov_begin__
+    builtins.__bcov_leaf__ = __bcov_leaf__
+    builtins.__bcov_end__ = __bcov_end__
+    package = os.path.join(_ROOT, "sqlglot") + os.sep
+
+    class Loader(importlib.machinery.SourceFileLoader):
+        def source_to_code(self, data, path, *, _optimize=-1):
+            rel = os.path.relpath(path, _ROOT)
+            text = importlib.util.decode_source(data)
+            tree = boolcov.rewrite(text, path, rel)
+            _bool_keys.update(f"{rel}|{r.lineno}|{r.col_offset}"
+                              for r in boolcov.truth_roots(ast.parse(text)))
+            return compile(tree, path, "exec", dont_inherit=True)
+
+    class Finder:
+        @staticmethod
+        def find_spec(name, path=None, target=None):
+            if name != "sqlglot" and not name.startswith("sqlglot."):
+                return None
+            spec = importlib.machinery.PathFinder.find_spec(name, path, target)
+            if spec and spec.origin and spec.origin.endswith(".py") and \
+                    os.path.realpath(spec.origin).startswith(package):
+                spec.loader = Loader(name, spec.origin)
+            return spec
+
+    import importlib.util
+    sys.meta_path.insert(0, Finder)
+
+
+def _taint(event, args):
+    if _current and event in ("subprocess.Popen", "os.posix_spawn", "os.fork", "os.exec",
+                              "_thread.start_new_thread", "os.system"):
+        _bool_tainted.add(_current)
+
+
+if _BOOLCOV:
+    _install_boolcov()
+    sys.addaudithook(_taint)
+elif os.environ.get("COVMAP_PREIMPORT") == "1":
     _record_lambda_calls()
 
 
@@ -241,7 +327,7 @@ def pytest_collection(session):
             except Exception:  # noqa: BLE001 - optional modules
                 pass
     _record_expression_classes()
-    if os.environ.get("COVMAP_PREIMPORT") == "1":
+    if os.environ.get("COVMAP_PREIMPORT") == "1" and not _BOOLCOV:
         _record_default_use()  # needs every module loaded first
     return None
 
@@ -265,6 +351,12 @@ def pytest_runtest_logfinish(nodeid, location):
 def pytest_sessionfinish(session):
     os.makedirs(_OUT, exist_ok=True)
     worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    if _BOOLCOV:
+        with open(os.path.join(_OUT, f"bool-{worker}.json"), "w") as f:
+            json.dump({"seen": {c: {k: sorted(v) for k, v in d.items()} for c, d in _bool_seen.items() if d},
+                       "keys": sorted(_bool_keys), "broken": sorted(_bool_broken),
+                       "tainted": sorted(_bool_tainted)}, f)
+        return
     if os.environ.get("COVMAP_PREIMPORT") == "1":
         with open(os.path.join(_OUT, f"lambdas-{worker}.json"), "w") as f:
             json.dump({k: sorted(v) for k, v in _lambda_calls.items()}, f)

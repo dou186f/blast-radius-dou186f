@@ -248,6 +248,7 @@ class Selector:
         self.sets = [[to_number[i] for i in s if to_number[i] is not None] for s in cmap["sets"]]
         self.impact = cmap["impact"]
         self.literal_reads = cmap.get("literal_reads", {})
+        self.bool_swaps = cmap.get("bool_swaps", {})
         self.strs = cmap["strs"]
         self.bslash = {p: set(v) for p, v in cmap["bslash"].items()}
         self.opens = cmap["opens"]
@@ -277,13 +278,43 @@ class Selector:
                         n, original = removed[0]
                         mask = literal_mask(rows.get(str(n), ()), original, added[0])
                         if mask is not None:
-                            return set(self.sets[mask]).union(self.unmapped)
+                            # Both this and the ordinary selection hold every test the
+                            # edit can reach, so their intersection does too.
+                            readers = set(self.sets[mask]).union(self.unmapped)
+                            ordinary = self.select_file(old, new, hunks)
+                            return readers if ordinary is ALL else readers & set(ordinary)
+        safe = self.swap_unaffected(files)
         for old_path, new_path, hunks in files:
             result = self.select_file(old_path, new_path, hunks)
             if result is ALL:
-                return ALL
+                if not safe:
+                    return ALL
+                result = [t["number"] for t in self.tests]
             chosen.update(result)
-        return chosen
+        return chosen - safe if safe else chosen
+
+    def swap_unaffected(self, files):
+        """One `and` swapped for `or` (or back) in a condition: the tests the map proved
+        cannot notice (every evaluation they made keeps its truth value). Empty otherwise."""
+        if len(files) != 1:
+            return set()
+        old, new, hunks = files[0]
+        rows = self.bool_swaps.get(old)
+        if old != new or not rows:
+            return set()
+        changes = [seg for start, lines in hunks for seg in segments(start, lines)]
+        if len(changes) != 1:
+            return set()
+        removed, added, _ = changes[0]
+        if len(removed) != 1 or len(added) != 1:
+            return set()
+        n, original = removed[0]
+        for col, word, index in rows.get(str(n), ()):
+            other = "or" if word == "and" else "and"
+            if original[col:col + len(word)] == word and \
+                    added[0] == original[:col] + other + original[col + len(word):]:
+                return set(self.sets[index])
+        return set()
 
     def select_file(self, old_path, new_path, hunks):
         path = old_path or new_path

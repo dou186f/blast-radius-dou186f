@@ -40,8 +40,10 @@ from pathlib import Path
 
 if __package__:
     from .fixture_reads import pair_readers
+    from .tokenizer_reads import TOKENIZER, copied_settings, numeric_escape_values
 else:
     from fixture_reads import pair_readers
+    from tokenizer_reads import TOKENIZER, copied_settings, numeric_escape_values
 
 FAMILY_DIRS = ("dialects", "parsers", "generators", "typing")
 # A name assigned in more places than this is polymorphic (arg_types, FUNCTIONS, ...):
@@ -272,7 +274,7 @@ def assigned_names(node):
 
 
 # --------------------------------------------------------------------------- main
-def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
+def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None, bool_dir=None):
     tests = json.load(open(tests_json))["tests"]
     test_ids = [t["id"] for t in tests]
     index_of = {tid: i for i, tid in enumerate(test_ids)}
@@ -643,6 +645,35 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
         return m
 
     literal_reads = defaultdict(lambda: defaultdict(list))
+    # A read which only copies a setting into storage can be attributed to the
+    # code that consumes the stored value. Keep the usual line map as fallback.
+    forwarded = defaultdict(list)
+    if serial_dir:
+        for value, reads in copied_settings(src, trees):
+            mask = 0
+            for path, line in reads:
+                if (path.startswith("tests/") or line in imp_pre.get(path, ())
+                        or line in imp_serial.get(path, ()) or line in imp_lazy.get(path, ())
+                        or line in order_dependent.get(path, ())):
+                    mask = all_tests
+                    break
+                mask |= cov.get(path, {}).get(line, 0)
+            if 0 < mask < all_tests:
+                forwarded[TOKENIZER].append((value, mask))
+
+        specs, reads = numeric_escape_values(src, trees)
+        if reads and not any(
+            line in imp_pre.get(path, ()) or line in imp_lazy.get(path, ())
+            or line in imp_serial.get(path, ()) or line in order_dependent.get(path, ())
+            for path, line in reads
+        ):
+            mask = 0
+            for path, line in reads:
+                mask |= cov.get(path, {}).get(line, 0)
+            if mask:
+                for path, literal in specs:
+                    forwarded[path].append((literal, mask))
+
     impact = {}
     strs = {}
     bslash = {}
@@ -824,6 +855,9 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
             end = len(raw[:value.end_col_offset].decode())
             literal_reads[rel][value.lineno].append((start, end, mask | nocov))
 
+        for value, mask in forwarded.get(rel, ()):
+            add_literal(value, mask)
+
         # Direct dictionary callbacks remain inert until called. Restrict the narrower
         # mask to literals in their bodies, leaving keys and lambda defaults alone.
         dict_callbacks = {v for d in ast.walk(trees[rel]) if isinstance(d, ast.Dict)
@@ -982,6 +1016,66 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
     pure_enums = sorted(n for n in class_bases if enum_kind(n) in ("pure", "mixed")
                         and n not in ("Enum", "Flag"))
 
+    # ---- and/or swaps (condition coverage, see boolcov.py)
+    # bool_swaps: {path: {line: [(col, old keyword, set of tests proven unaffected)]}}.
+    # A test is proven unaffected when it evaluated the condition and every evaluation
+    # charged to it (its setup, its run, and import time) has the same truth value with
+    # the keyword swapped. The selector only ever removes such tests from its selection.
+    bool_swaps = defaultdict(dict)
+    if bool_dir:
+        try:
+            from . import boolcov
+        except ImportError:
+            import boolcov
+        seen_by = defaultdict(lambda: defaultdict(set))  # key -> context -> values
+        keys, broken, tainted, workers = set(), set(), set(), 0
+        for log in glob.glob(os.path.join(bool_dir, "bool-*.json")):
+            data = json.load(open(log))
+            workers += 1
+            keys |= set(data["keys"])
+            broken |= set(data["broken"])
+            tainted |= set(data["tainted"])
+            for context, per_key in data["seen"].items():
+                for key, values in per_key.items():
+                    seen_by[key][context].update(values)
+
+        def context_mask(context):
+            if not context:
+                return all_tests
+            nodeid, _, phase = context.rpartition("|")
+            nodeid = nodeid.split("[", 1)[0]
+            if phase == "run" and nodeid in index_of:
+                return 1 << index_of[nodeid]
+            return by_class.get(nodeid.rsplit("::", 1)[0], all_tests) if phase != "run" else all_tests
+
+        tainted_mask = 0
+        for context in tainted:
+            tainted_mask |= context_mask(context)
+        for rel, tree in trees.items():
+            if not rel.startswith("sqlglot/"):
+                continue
+            text = sources[rel]
+            od = order_dependent.get(rel, set())
+            for line, col, word, other, root, mutant in boolcov.swaps(text, tree):
+                key = f"{rel}|{root.lineno}|{root.col_offset}"
+                if key not in keys or key in broken or key not in seen_by:
+                    continue
+                func = function_at(rel, root.lineno)
+                span = range(func.lineno, func.end_lineno + 1) if func else range(
+                    root.lineno, root.end_lineno + 1)
+                if any(n in od for n in span):
+                    continue  # cached results reach tests that never evaluate it
+                seen, unsafe = 0, tainted_mask
+                for context, values in seen_by[key].items():
+                    mask = context_mask(context)
+                    if context:
+                        seen |= mask
+                    if not boolcov.same_truth(root, mutant, values):
+                        unsafe |= mask
+                safe = seen & ~unsafe
+                if safe:
+                    bool_swaps[rel].setdefault(str(line), []).append((col, word, safe))
+
     result = {
         "pure_enums": pure_enums,
         "tests": test_ids,
@@ -989,6 +1083,8 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
         "impact": {p: [intern(m) for m in v] for p, v in impact.items()},
         "literal_reads": {p: {n: [(a, b, intern(m)) for a, b, m in spans]
                                for n, spans in rows.items()} for p, rows in literal_reads.items()},
+        "bool_swaps": {p: {n: [(c, w, intern(m)) for c, w, m in v] for n, v in rows.items()}
+                       for p, rows in bool_swaps.items()},
         "strs": strs,
         "bslash": bslash,
         "fixture_fields": {p: ["".join(map(str, roles)), [intern(m) for m in omitted]]
@@ -1006,4 +1102,4 @@ def main(src, tests_json, lazy_dir, pre_dir, out, serial_dir=None):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:7])
+    main(*sys.argv[1:8])

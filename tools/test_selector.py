@@ -44,3 +44,26 @@ class CoverageSelection(unittest.TestCase):
         self.assertEqual(self.change(self.fixture, 2, "expected", "changed"), {0})
         for new in ["changed;", "# execute: true", "-- comment", ""]:
             self.assertEqual(self.change(self.fixture, 2, "expected", new), {0, 1})
+
+
+class BoolSwap(unittest.TestCase):
+    def setUp(self):
+        tests = [{"number": n, "id": str(n), "file": "tests/test_example.py"} for n in range(3)]
+        self.line = "    if a and (b or c):"
+        self.selector = Selector(tests, {
+            "tests": ["0", "1", "2"], "sets": [[], [0, 1, 2], [1, 2]], "nocov": 0,
+            "impact": {"sqlglot/example.py": [1, 1]}, "strs": {}, "bslash": {}, "tspans": {},
+            "bool_swaps": {"sqlglot/example.py": {"1": [(self.line.index("or"), "or", 2)]}},
+            "opens": {},
+        })
+
+    def change(self, new):
+        patch = f"--- a/sqlglot/example.py\n+++ b/sqlglot/example.py\n@@ -1 +1 @@\n-{self.line}\n+{new}\n"
+        return self.selector.select(patch)
+
+    def test_proven_swap_drops_unaffected_tests(self):
+        self.assertEqual(self.change(self.line.replace("or", "and")), {0})
+
+    def test_other_edits_keep_line_coverage(self):
+        self.assertEqual(self.change(self.line.replace("and", "or", 1)), {0, 1, 2})
+        self.assertEqual(self.change(self.line.replace("or c", "or d")), {0, 1, 2})
