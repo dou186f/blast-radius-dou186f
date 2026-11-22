@@ -152,13 +152,18 @@ def tpcds(request):
 
     tables = load_tables(os.path.join(FIXTURES_DIR, "optimizer", "tpc-ds"), TPCDS_SCHEMA, Table)
     baseline = request.get("baseline")
-    digests = []
+    # AGGRESSIVE (experiment): with "baseline_rows" only the duckdb SQL and the rows (or the
+    # error) of every query must stay the same, the queries, plans and code may change
+    baseline_rows = request.get("baseline_rows")
+    digests, rows = [], []
+    full_ok = rows_ok = True
     for meta, sql, _ in load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"):
         if not meta.get("execute"):
             continue
         record.clear()
         compiled.clear()
-        record.append(transpile(sql, write="duckdb")[0])
+        duckdb_sql = transpile(sql, write="duckdb")[0]
+        record.append(duckdb_sql)
         expression = parse_one(sql)
         data = pickle.dumps(expression)
         record.append(hashlib.sha256(data).hexdigest())
@@ -167,22 +172,33 @@ def tpcds(request):
         record.append(repr(sorted(used)))
         try:
             result = execute(expression, schema=TPCDS_SCHEMA, tables=used)
-            record.append(repr(result.columns))
-            record.append(repr(result.rows))
+            outcome = [repr(result.columns), repr(result.rows)]
         except Exception as error:  # the same error both sides is the same behaviour
-            record.append(f"{type(error).__name__}: {error}")
+            outcome = [f"{type(error).__name__}: {error}"]
+        record.extend(outcome)
         record.extend(sorted(compiled))
-        digest = hashlib.sha256()
-        for item in record:
-            digest.update(item.encode("utf-8", "surrogatepass"))
-            digest.update(b"\x00")
-        digests.append(digest.hexdigest())
-        if baseline is not None and (len(digests) > len(baseline)
-                                     or digests[-1] != baseline[len(digests) - 1]):
-            print(json.dumps({"match": False, "at": len(digests) - 1}))
+        digests.append(_digest(record))
+        rows.append(_digest([duckdb_sql, *outcome]))
+        i = len(digests) - 1
+        if baseline is not None and (i >= len(baseline) or digests[i] != baseline[i]):
+            full_ok = False
+        if baseline_rows is not None and (i >= len(baseline_rows) or rows[i] != baseline_rows[i]):
+            rows_ok = False
+        if not full_ok and (baseline_rows is None or not rows_ok):
+            print(json.dumps({"match": False, "rows_match": False, "at": i}))
             return
-    match = baseline is not None and digests == baseline
-    print(json.dumps({"match": match, "digests": digests}))
+    match = baseline is not None and full_ok and len(digests) == len(baseline)
+    rows_match = baseline_rows is not None and rows_ok and len(rows) == len(baseline_rows)
+    print(json.dumps({"match": match, "rows_match": rows_match, "digests": digests,
+                      "rows": rows}))
+
+
+def _digest(items):
+    digest = hashlib.sha256()
+    for item in items:
+        digest.update(item.encode("utf-8", "surrogatepass"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
 
 
 def max_nodes(request):

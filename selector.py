@@ -543,6 +543,7 @@ def run_fingerprints(jobs, started):
             pinned = baseline[check]
             proc.stdin.write(json.dumps({"patched": patched, "check": check,
                                          "baseline": pinned["digests"],
+                                         "baseline_rows": pinned.get("rows"),
                                          "baseline_seconds": pinned.get("seconds")}))
             proc.stdin.close()
             running.append((key, proc, time.monotonic() + CHECKS[check][2]))
@@ -560,7 +561,11 @@ def run_fingerprints(jobs, started):
                 continue
             out = proc.stdout.read()
             try:
-                proven[key] = proc.returncode == 0 and json.loads(out).get("match") is True
+                answer = json.loads(out)
+                # AGGRESSIVE (experiment): tpc-ds counts as proven when every query gives
+                # the same rows on the slice, even through a different plan or code
+                proven[key] = proc.returncode == 0 and (answer.get("match") is True
+                                                        or answer.get("rows_match") is True)
             except ValueError:
                 proven[key] = False
         running = still

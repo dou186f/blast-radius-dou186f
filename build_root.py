@@ -48,7 +48,11 @@ def main(root, baseline_path):
             runs.append(json.loads(out.stdout))
         if runs[0]["digests"] != runs[1]["digests"] or len(runs[0]["digests"]) < least:
             sys.exit(f"{check} fingerprint is not deterministic")
+        if runs[0].get("rows") != runs[1].get("rows"):
+            sys.exit(f"{check} rows are not deterministic")
         baseline[check] = {"digests": runs[0]["digests"]}
+        if "rows" in runs[0]:
+            baseline[check]["rows"] = runs[0]["rows"]
         if "seconds" in runs[0]:  # the slower of the two runs: the slowdown check's base
             baseline[check]["seconds"] = max(run["seconds"] for run in runs)
     os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
