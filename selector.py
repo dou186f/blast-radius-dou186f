@@ -40,6 +40,8 @@ FP_PARALLEL = 2
 FP_LAUNCH_BY = 110.0  # seconds after start: no new fingerprint is started later
 FP_KILL_AT = 150.0    # seconds after start: unfinished fingerprints keep the test
 WORKER_COST_MS = 2000
+GAMBLE_TESTS = ("tests/test_generator.py::TestGenerator::test_generator_memory",)
+GAMBLE_BELOW = 1000
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # Files every test module imports: any real change there can break anything.
@@ -583,6 +585,7 @@ def main() -> None:
     checks = {name: (number_of[test], least) for name, (test, least, _) in CHECKS.items()
               if test in number_of}
     fingerprint = FP_ROOT.is_dir() and FP_BASELINE.is_file() and bool(checks)
+    gamble = {number_of[t] for t in GAMBLE_TESTS if t in number_of}
     with gzip.open(MAP, "rt") as f:
         selector = Selector(tests, json.load(f))
 
@@ -626,6 +629,10 @@ def main() -> None:
             numbers = [n for n in numbers if n not in dropped]
             names = ", ".join(t["id"].split("::")[-1] for t in tests if t["number"] in dropped)
             print(f"{stem}: fingerprint unchanged, dropped {names}", file=sys.stderr)
+        if len(numbers) < GAMBLE_BELOW:
+            # AGGRESSIVE (experiment): on 189 labelled commits these never failed outside
+            # selections of 1000+ tests (massive breaks), while costing seconds each time
+            numbers = [n for n in numbers if n not in gamble]
         workers = pack(numbers, duration_ms)
         lines.append(json.dumps({"commit": stem, "workers": workers}, separators=(",", ":")))
         print(f"{stem}: {len(numbers)} tests on {len(workers)} workers", file=sys.stderr)
