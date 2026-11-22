@@ -1,21 +1,24 @@
-"""Fingerprint of everything sqlglot computes for tests/test_executor.py::test_execute_tpcds.
+"""Fingerprints that prove a patch cannot change the outcome of sqlglot's two slowest tests.
 
-    python fingerprint.py <root> < {"patched": {"sqlglot/x.py": "<new source>", ...}}
+    python fingerprint.py <root> < {"check": "tpcds" | "max_nodes", "patched": {...},
+                                    "baseline": [...], "baseline_seconds": ...}
 
-<root> holds sqlglot/ and the tests/ files the test reads (helpers.py, the tpc-ds fixtures).
-Patched modules are served from memory, every other module from <root> (and its .pyc).
+<root> holds sqlglot/ and the tests/ files the checks read (helpers.py, the tpc-ds
+fixtures). Patched modules ({"sqlglot/x.py": "<new source>"}) are served from memory,
+every other module from <root> (and its .pyc).
 
-The test parses each TPC-DS query, pickles it to a worker, runs sqlglot's executor on it
-(optimize -> Plan -> Python code generated per step -> run over the tables) and compares
-the rows with duckdb's answer to transpile(sql, write="duckdb"). This script walks the same
-path on a small slice of every table and hashes each intermediate: the duckdb SQL, the
-pickle, the optimized tree (with types), the plan, every piece of generated Python code
-and the rows. When the digest equals the one of the pinned commit, the patched sqlglot
-fed the test exactly the same queries, plans and code as the unpatched one.
+tpcds: tests/test_executor.py::test_execute_tpcds parses each TPC-DS query, pickles it to
+a worker, runs sqlglot's executor on it (optimize -> Plan -> Python code generated per
+step -> run over the tables) and compares the rows with duckdb's answer to
+transpile(sql, write="duckdb"). The check walks the same path on a small slice of every
+table and hashes each intermediate: the duckdb SQL, the pickle, the optimized SQL, the
+plan, every piece of generated Python code and the rows.
 
-With "baseline" (the pinned commit's per-query digests) in the request it stops at the
-first query that differs. Prints {"match": bool, "digests": [...]} or {"match": false,
-"at": i} on stdout; anything unexpected exits non-zero.
+max_nodes: tests/test_parser.py::test_max_nodes, see max_nodes() below.
+
+With "baseline" (the pinned commit's digests, made by build_root.py) the run stops at the
+first digest that differs. Prints {"match": bool, "digests": [...]} or {"match": false,
+"at": i} on stdout; anything unexpected exits non-zero, which callers treat as no match.
 """
 
 import ast
@@ -116,13 +119,7 @@ def load_tables(fixtures, schema, Table):
     return tables
 
 
-def main():
-    root = os.path.abspath(sys.argv[1])
-    request = json.load(sys.stdin)
-    patched = {os.path.join(root, rel): src for rel, src in request.get("patched", {}).items()}
-    sys.meta_path.insert(0, PatchFinder(patched))
-    sys.path.insert(0, root)
-
+def tpcds(request):
     import sqlglot.executor as executor_module
     import sqlglot.executor.python as python_module
     from sqlglot import find_tables, parse_one, transpile
@@ -186,6 +183,82 @@ def main():
             return
     match = baseline is not None and digests == baseline
     print(json.dumps({"match": match, "digests": digests}))
+
+
+def max_nodes(request):
+    """tests/test_parser.py::TestParser::test_max_nodes with its big query cut from 10000
+    columns to WIDTH: every cheap step exactly as the test runs it, and for the big query
+    the tokens, the tree, the parser's node count and the max_nodes errors at two limits
+    below its size. The test parses the same column 10000 times; these show the patched
+    parser treats that column, its count and the limit exactly as the pinned one does.
+    A patch that slows the parse down more than SLOWDOWN times is never proven."""
+    import time
+
+    from sqlglot import exp, parse_one
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.errors import ParseError
+
+    baseline = request.get("baseline")
+    digests = []
+    started = time.process_time()
+
+    def step(fn):
+        try:
+            value = repr(fn())
+        except Exception as error:
+            value = f"{type(error).__name__}: {error}"
+        digests.append(hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest())
+        if baseline is not None and (len(digests) > len(baseline)
+                                     or digests[-1] != baseline[len(digests) - 1]):
+            print(json.dumps({"match": False, "at": len(digests) - 1}))
+            sys.exit(0)
+
+    step(lambda: isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select))
+    cols = [f"col{i}" for i in range(500)]
+    step(lambda: parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000))
+
+    sql = "SELECT " + ",".join("x" + "=x" * 100 for _ in range(WIDTH))
+    dialect = Dialect.get_or_raise(None)
+    step(lambda: [(t.token_type, t.text, t.line, t.col, t.start, t.end) for t in dialect.tokenize(sql)])
+
+    def count():
+        parser = dialect.parser(max_nodes=10**9)
+        tree = parser.parse(dialect.tokenize(sql), sql)
+        return parser._node_count, tree
+
+    step(count)
+    def limited(limit):
+        try:
+            return "no error", parse_one(sql, max_nodes=limit)
+        except ParseError as error:  # what the test asserts, and the whole error
+            message = str(error)
+            return ("Maximum number of AST nodes" in message, f"({limit})" in message,
+                    message, error.errors)
+
+    for limit in LIMITS:
+        step(lambda: limited(limit))
+
+    step(lambda: parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5))
+    step(lambda: isinstance(parse_one("SELECT 1, 2, 3"), exp.Select))
+    seconds = time.process_time() - started
+    limit = request.get("baseline_seconds")
+    match = baseline is not None and digests == baseline and \
+        (limit is None or seconds <= SLOWDOWN * limit + 0.5)
+    print(json.dumps({"match": match, "digests": digests, "seconds": seconds}))
+
+
+WIDTH = 150                # columns of the big query (the test uses 10000)
+LIMITS = (10_000, 20_000)  # both below the cut query's ~45k nodes, like the test's 50000
+SLOWDOWN = 4.0
+
+
+def main():
+    root = os.path.abspath(sys.argv[1])
+    request = json.load(sys.stdin)
+    patched = {os.path.join(root, rel): src for rel, src in request.get("patched", {}).items()}
+    sys.meta_path.insert(0, PatchFinder(patched))
+    sys.path.insert(0, root)
+    {"tpcds": tpcds, "max_nodes": max_nodes}[request.get("check", "tpcds")](request)
 
 
 if __name__ == "__main__":

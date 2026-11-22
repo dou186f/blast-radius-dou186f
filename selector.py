@@ -26,15 +26,17 @@ MAX_WORKERS = 8
 # tpc-ds fingerprint (fingerprint.py, built by build_root.py): only present in the image
 APP = Path(__file__).resolve().parent
 FP_ROOT = APP / "root"
-FP_BASELINE = APP / "data" / "tpcds_baseline.json"
+FP_BASELINE = APP / "data" / "fp_baseline.json"
 TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
+# check name in fingerprint.py -> (test it can prove unaffected, least saving worth its
+# CPU, seconds before it is killed: a normal run takes up to ~9 s and ~4 s)
+CHECKS = {"tpcds": (TPCDS, 5000, 15.0), "max_nodes": (MAX_NODES, 2000, 6.0)}
 # Executor and planner edits go through the fingerprint too: it runs the executor on a
 # slice of every table, and on 39 labelled executor/planner mutants it never matched
 # when the test failed (17 caught, 19 proven, 3 kept needlessly).
 FP_EXCLUDED = ()
-FP_MIN_SAVING_MS = 5000
 FP_PARALLEL = 2
-FP_TIMEOUT = 25.0     # seconds for one fingerprint
 FP_LAUNCH_BY = 110.0  # seconds after start: no new fingerprint is started later
 FP_KILL_AT = 150.0    # seconds after start: unfinished fingerprints keep the test
 WORKER_COST_MS = 2000
@@ -523,7 +525,8 @@ def fingerprint_request(text: str):
 
 
 def run_fingerprints(jobs, started):
-    """jobs: [(key, patched)] -> {key: True when the fingerprint equals the pinned one}.
+    """jobs: [(key, check, patched)] -> {key: True when the check's fingerprint equals the
+    pinned one}.
     At most FP_PARALLEL at a time; anything that fails, times out or runs past the
     deadlines counts as not proven."""
     baseline = json.loads(FP_BASELINE.read_text())
@@ -533,24 +536,27 @@ def run_fingerprints(jobs, started):
     while queue or running:
         now = time.monotonic() - started
         while queue and len(running) < FP_PARALLEL and now < FP_LAUNCH_BY:
-            key, patched = queue.pop(0)
+            key, check, patched = queue.pop(0)
             proc = subprocess.Popen([sys.executable, script, str(FP_ROOT)],
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, env=env, text=True)
-            proc.stdin.write(json.dumps({"patched": patched, "baseline": baseline}))
+            pinned = baseline[check]
+            proc.stdin.write(json.dumps({"patched": patched, "check": check,
+                                         "baseline": pinned["digests"],
+                                         "baseline_seconds": pinned.get("seconds")}))
             proc.stdin.close()
-            running.append((key, proc, time.monotonic()))
+            running.append((key, proc, time.monotonic() + CHECKS[check][2]))
         if now >= FP_LAUNCH_BY:
             queue.clear()
         still = []
-        for key, proc, t0 in running:
+        for key, proc, deadline in running:
             if proc.poll() is None:
-                if time.monotonic() - t0 > FP_TIMEOUT or time.monotonic() - started > FP_KILL_AT:
+                if time.monotonic() > deadline or time.monotonic() - started > FP_KILL_AT:
                     proc.kill()
                     proc.wait()
                     print(f"{key}: fingerprint timed out", file=sys.stderr)
                 else:
-                    still.append((key, proc, t0))
+                    still.append((key, proc, deadline))
                 continue
             out = proc.stdout.read()
             try:
@@ -568,8 +574,10 @@ def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     duration_ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     all_numbers = [t["number"] for t in tests]
-    tpcds = next((t["number"] for t in tests if t["id"] == TPCDS), None)
-    fingerprint = FP_ROOT.is_dir() and FP_BASELINE.is_file() and tpcds is not None
+    number_of = {t["id"]: t["number"] for t in tests}
+    checks = {name: (number_of[test], least) for name, (test, least, _) in CHECKS.items()
+              if test in number_of}
+    fingerprint = FP_ROOT.is_dir() and FP_BASELINE.is_file() and bool(checks)
     with gzip.open(MAP, "rt") as f:
         selector = Selector(tests, json.load(f))
 
@@ -583,25 +591,36 @@ def main() -> None:
             chosen = ALL
         numbers = all_numbers if chosen is ALL else sorted(chosen)
         results.append((patch.stem, numbers))
-        if fingerprint and chosen is not ALL and tpcds in chosen:
-            without = [n for n in numbers if n != tpcds]
-            saving = cost_ms(numbers, duration_ms) - cost_ms(without, duration_ms)
-            if saving >= FP_MIN_SAVING_MS:
-                try:
-                    patched = fingerprint_request(text)
-                except Exception as error:  # a patch we cannot apply: keep the test
-                    print(f"{patch.stem}: {error!r}, keeping tpc-ds", file=sys.stderr)
-                    patched = None
-                if patched:
-                    jobs.append((saving, patch.stem, patched))
+        present = {name: n for name, (n, _) in checks.items() if n in set(numbers)} \
+            if fingerprint else {}
+        if not present:
+            continue
+        try:
+            patched = fingerprint_request(text)
+        except Exception as error:  # a patch we cannot apply: keep the tests
+            print(f"{patch.stem}: {error!r}, no fingerprint", file=sys.stderr)
+            patched = None
+        if not patched:
+            continue
+        # each check is worth running when dropping its test saves enough even with
+        # the other candidates already gone
+        none = cost_ms([n for n in numbers if n not in present.values()], duration_ms)
+        for name, n in present.items():
+            others = {m for m in present.values() if m != n}
+            saving = cost_ms([m for m in numbers if m not in others], duration_ms) - none
+            if saving >= checks[name][1]:
+                jobs.append((saving, (patch.stem, name), name, patched))
     jobs.sort(key=lambda job: -job[0])  # the biggest savings first, in case time runs out
-    proven = run_fingerprints([(key, patched) for _, key, patched in jobs], started) if jobs else {}
+    proven = run_fingerprints([(key, name, patched) for _, key, name, patched in jobs],
+                              started) if jobs else {}
 
     lines = []
     for stem, numbers in results:
-        if proven.get(stem):
-            numbers = [n for n in numbers if n != tpcds]
-            print(f"{stem}: tpc-ds fingerprint unchanged, test_execute_tpcds dropped", file=sys.stderr)
+        dropped = {checks[name][0] for (key, name), ok in proven.items() if key == stem and ok}
+        if dropped:
+            numbers = [n for n in numbers if n not in dropped]
+            names = ", ".join(t["id"].split("::")[-1] for t in tests if t["number"] in dropped)
+            print(f"{stem}: fingerprint unchanged, dropped {names}", file=sys.stderr)
         workers = pack(numbers, duration_ms)
         lines.append(json.dumps({"commit": stem, "workers": workers}, separators=(",", ":")))
         print(f"{stem}: {len(numbers)} tests on {len(workers)} workers", file=sys.stderr)

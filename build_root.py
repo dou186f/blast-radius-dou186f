@@ -1,7 +1,7 @@
 """Docker build step: fetch sqlglot at the pinned commit, keep what fingerprint.py needs,
-compile it, and record the pinned commit's tpc-ds fingerprint.
+compile it, and record the pinned commit's fingerprints (tpc-ds and max_nodes).
 
-    python build_root.py /app/root /app/data/tpcds_baseline.json
+    python build_root.py /app/root /app/data/fp_baseline.json
 """
 
 import compileall
@@ -38,16 +38,22 @@ def main(root, baseline_path):
         sys.exit("compileall failed")
     env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fingerprint.py")
-    runs = []
-    for _ in range(2):
-        out = subprocess.run([sys.executable, script, root], input="{}", capture_output=True,
-                             text=True, env=env, check=True)
-        runs.append(json.loads(out.stdout)["digests"])
-    if runs[0] != runs[1] or len(runs[0]) < 50:
-        sys.exit("tpc-ds fingerprint is not deterministic")
+    baseline = {}
+    for check, least in (("tpcds", 50), ("max_nodes", 5)):
+        runs = []
+        for _ in range(2):
+            out = subprocess.run([sys.executable, script, root],
+                                 input=json.dumps({"check": check}), capture_output=True,
+                                 text=True, env=env, check=True)
+            runs.append(json.loads(out.stdout))
+        if runs[0]["digests"] != runs[1]["digests"] or len(runs[0]["digests"]) < least:
+            sys.exit(f"{check} fingerprint is not deterministic")
+        baseline[check] = {"digests": runs[0]["digests"]}
+        if "seconds" in runs[0]:  # the slower of the two runs: the slowdown check's base
+            baseline[check]["seconds"] = max(run["seconds"] for run in runs)
     os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
     with open(baseline_path, "w") as f:
-        json.dump(runs[0], f)
+        json.dump(baseline, f)
 
 
 if __name__ == "__main__":

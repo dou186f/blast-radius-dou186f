@@ -14,12 +14,13 @@ for f in ("__init__.py", "helpers.py"):
 shutil.copytree(os.path.join(src, "tests/fixtures/optimizer/tpc-ds"), os.path.join(root, "tests/fixtures/optimizer/tpc-ds"))
 compileall.compile_dir(root, quiet=1)
 env = dict(os.environ, PYTHONHASHSEED="0")
+CHECK = os.environ.get("CHECK", "tpcds")
 
 
-def run(patched, baseline=None):
+def run(patched, baseline=None, seconds=None):
     r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     try:
-        p = subprocess.run([sys.executable, script, root], input=json.dumps({"patched": patched, "baseline": baseline}),
+        p = subprocess.run([sys.executable, script, root], input=json.dumps({"patched": patched, "baseline": baseline, "check": CHECK, "baseline_seconds": seconds}),
                            capture_output=True, text=True, env=env, timeout=30)
     except subprocess.TimeoutExpired:
         return {"error": "timeout", "cpu": 30.0}
@@ -33,9 +34,10 @@ def run(patched, baseline=None):
 first, second = run({}), run({})
 assert first["digests"] == second["digests"], "baseline is not deterministic"
 baseline = first["digests"]
-out = {"_base": [first["cpu"], second["cpu"], run({}, baseline)]}
+seconds = first.get("seconds")
+out = {"_base": [first["cpu"], second["cpu"], run({}, baseline, seconds)]}
 print(out["_base"], flush=True)
 for cid, patched in json.load(open(req_path)).items():
-    out[cid] = run(patched, baseline)
+    out[cid] = run(patched, baseline, seconds)
     print(cid, out[cid], flush=True)
 json.dump(out, open(out_path, "w"))
